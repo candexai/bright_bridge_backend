@@ -301,6 +301,7 @@ router.post('/refer/:code/register', async (req, res) => {
             const toolId = await registerTool(school._id.toString(), agentId);
             if (toolId) {
                 const globalTimeToolId = "tool_1801kmyr9pdpemts5qr0f1xys3yy";
+                school.toolIds = [toolId, globalTimeToolId];
                 // Link tools to agent (both the school-specific and global time tool)
                 await patchAgentPrompt(agentId, {
                     tool_ids: [toolId, globalTimeToolId],

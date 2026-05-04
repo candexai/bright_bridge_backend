@@ -25,7 +25,8 @@ const {
     patchAgentPrompt,
     registerTool,
     createSchoolAgent,
-    APPOINTMENT_AGENT_PROMPT
+    APPOINTMENT_AGENT_PROMPT,
+    GLOBAL_TIME_TOOL_ID
 } = require('../utils/elevenlabs');
 const { getPlanDef } = require('../config/billingPlans');
 const {
@@ -129,7 +130,8 @@ async function updateAgentWithKnowledgeBase(
     systemPrompt,
     knowledgeBaseId,
     toolIds = [],
-    humanTransfer = { enabled: false, condition: '', phoneNumber: '' }
+    humanTransfer = { enabled: false, condition: '', phoneNumber: '' },
+    schoolIdForToolRepair = null
 ) {
     const baseUrl = process.env.ELEVENLABS_API_URL;
     if (!baseUrl) {
@@ -156,16 +158,43 @@ async function updateAgentWithKnowledgeBase(
             enable_human_transfer: Boolean(humanTransfer?.enabled),
         };
 
+        // Normalize tool IDs; we'll sync them via /agents endpoint to avoid /prompt validation conflicts.
+        const normalizedToolIds = Array.isArray(toolIds)
+            ? toolIds.filter(Boolean).map((id) => String(id).trim()).filter(Boolean)
+            : [];
+        const finalToolIds = [...new Set([...normalizedToolIds, GLOBAL_TIME_TOOL_ID])];
+
         if (humanTransfer?.enabled && humanTransfer?.condition && humanTransfer?.phoneNumber) {
             payload.human_transfer_rules = [{
                 condition: humanTransfer.condition,
                 phone_number: humanTransfer.phoneNumber,
                 transfer_type: 'sip_refer'
             }];
+        } else {
+            payload.human_transfer_rules = [];
+        }
 
-            // Keep built-in transfer tool explicitly active so ElevenLabs Tools UI reflects the rule.
-            payload.built_in_tools = {
-                transfer_to_number: {
+        console.log('[Agent PATCH] ========== PATCH REQUEST ==========');
+        console.log(`[Agent PATCH] HIT at ${patchStartedAt}`);
+        console.log(`[Agent PATCH] Request URL: ${url}`);
+        console.log(`[Agent PATCH] Agent ID: ${agentId}`);
+        console.log(`[Agent PATCH] Tool IDs (sync via /agents):`, finalToolIds);
+        console.log('[Agent PATCH] built_in_tools.transfer_to_number enabled:', Boolean(payload?.built_in_tools?.transfer_to_number));
+        console.log(`[Agent PATCH] Payload (full):`, JSON.stringify(payload, null, 2));
+        console.log('[Agent PATCH] ====================================');
+
+        const response = await axios.patch(url, payload, {
+            headers: {
+                'Content-Type': 'application/json',
+                ...(process.env.ELEVENLABS_API_KEY && { 'Authorization': `Bearer ${process.env.ELEVENLABS_API_KEY}` })
+            }
+        });
+
+        // Keep transfer tool config on /agents endpoint only to avoid /prompt conflicts with tool_ids.
+        try {
+            const ensureToolUrl = `${baseUrl}/api/v1/agents/${agentId}`;
+            const transferToolConfig = (humanTransfer?.enabled && humanTransfer?.condition && humanTransfer?.phoneNumber)
+                ? {
                     type: 'system',
                     name: 'transfer_to_number',
                     response_timeout_secs: 20,
@@ -192,83 +221,76 @@ async function updateAgentWithKnowledgeBase(
                         enable_client_message: true
                     }
                 }
-            };
-        } else {
-            payload.human_transfer_rules = [];
-            payload.built_in_tools = {
-                transfer_to_number: null
-            };
-        }
-
-        console.log('[Agent PATCH] ========== PATCH REQUEST ==========');
-        console.log(`[Agent PATCH] HIT at ${patchStartedAt}`);
-        console.log(`[Agent PATCH] Request URL: ${url}`);
-        console.log(`[Agent PATCH] Agent ID: ${agentId}`);
-        console.log(`[Agent PATCH] Tool IDs:`, payload.tool_ids);
-        console.log('[Agent PATCH] built_in_tools.transfer_to_number enabled:', Boolean(payload?.built_in_tools?.transfer_to_number));
-        console.log(`[Agent PATCH] Payload (full):`, JSON.stringify(payload, null, 2));
-        console.log('[Agent PATCH] ====================================');
-
-        const response = await axios.patch(url, payload, {
-            headers: {
-                'Content-Type': 'application/json',
-                ...(process.env.ELEVENLABS_API_KEY && { 'Authorization': `Bearer ${process.env.ELEVENLABS_API_KEY}` })
-            }
-        });
-
-        // ElevenLabs may accept human_transfer_rules on /prompt but still keep built-in transfer tool disabled.
-        // Ensure transfer_to_number is explicitly enabled via /agents endpoint when human transfer is ON.
-        if (humanTransfer?.enabled && humanTransfer?.condition && humanTransfer?.phoneNumber) {
-            try {
-                const ensureToolUrl = `${baseUrl}/api/v1/agents/${agentId}`;
-                const ensureToolPayload = {
-                    conversation_config: {
-                        agent: {
-                            prompt: {
-                                built_in_tools: {
-                                    transfer_to_number: {
-                                        type: 'system',
-                                        name: 'transfer_to_number',
-                                        response_timeout_secs: 20,
-                                        disable_interruptions: false,
-                                        force_pre_tool_speech: false,
-                                        pre_tool_speech: 'auto',
-                                        assignments: [],
-                                        tool_call_sound: null,
-                                        tool_call_sound_behavior: 'auto',
-                                        tool_error_handling_mode: 'auto',
-                                        params: {
-                                            system_tool_type: 'transfer_to_number',
-                                            transfers: [{
-                                                custom_sip_headers: [],
-                                                transfer_destination: {
-                                                    type: 'phone',
-                                                    phone_number: humanTransfer.phoneNumber
-                                                },
-                                                transfer_type: 'sip_refer',
-                                                post_dial_digits: null,
-                                                phone_number: humanTransfer.phoneNumber,
-                                                condition: humanTransfer.condition
-                                            }],
-                                            enable_client_message: true
-                                        }
-                                    }
-                                }
+                : null;
+            const ensureToolPayload = {
+                conversation_config: {
+                    agent: {
+                        prompt: {
+                            tool_ids: finalToolIds,
+                            built_in_tools: {
+                                transfer_to_number: transferToolConfig
                             }
                         }
                     }
-                };
+                }
+            };
 
-                const ensureToolResponse = await axios.patch(ensureToolUrl, ensureToolPayload, {
-                    headers: {
-                        'Content-Type': 'application/json',
-                        ...(process.env.ELEVENLABS_API_KEY && { 'Authorization': `Bearer ${process.env.ELEVENLABS_API_KEY}` })
+            const ensureToolResponse = await axios.patch(ensureToolUrl, ensureToolPayload, {
+                headers: {
+                    'Content-Type': 'application/json',
+                    ...(process.env.ELEVENLABS_API_KEY && { 'Authorization': `Bearer ${process.env.ELEVENLABS_API_KEY}` })
+                }
+            });
+            console.log('[Agent PATCH] transfer_to_number synced via /agents endpoint');
+            console.log('[Agent PATCH] /agents ensure status:', ensureToolResponse.status);
+        } catch (ensureErr) {
+            console.error('[Agent PATCH] Failed to sync transfer_to_number via /agents endpoint:', ensureErr?.response?.status, ensureErr?.response?.data || ensureErr?.message);
+        }
+
+        // Re-bind custom tool IDs via /prompt in a dedicated call.
+        // This avoids the "both tools and tool IDs" validation conflict when transfer fields are present.
+        try {
+            const toolOnlyPayload = { tool_ids: finalToolIds };
+            const toolOnlyResponse = await axios.patch(url, toolOnlyPayload, {
+                headers: {
+                    'Content-Type': 'application/json',
+                    ...(process.env.ELEVENLABS_API_KEY && { 'Authorization': `Bearer ${process.env.ELEVENLABS_API_KEY}` })
+                }
+            });
+            console.log('[Agent PATCH] tool_ids rebound via /prompt endpoint');
+            console.log('[Agent PATCH] /prompt tool-only status:', toolOnlyResponse.status);
+        } catch (toolBindErr) {
+            console.error('[Agent PATCH] Failed to rebind tool_ids via /prompt endpoint:', toolBindErr?.response?.status, toolBindErr?.response?.data || toolBindErr?.message);
+
+            const errDetail = JSON.stringify(toolBindErr?.response?.data || {});
+            const isMissingToolId = toolBindErr?.response?.status === 404 && /Documents with ids/i.test(errDetail);
+            if (isMissingToolId && schoolIdForToolRepair) {
+                try {
+                    console.warn('[Agent PATCH] Detected stale tool id(s); attempting auto-repair via registerTool');
+                    const repairedToolId = await registerTool(String(schoolIdForToolRepair), agentId);
+                    if (repairedToolId) {
+                        const repairedToolIds = [...new Set([repairedToolId, GLOBAL_TIME_TOOL_ID])];
+
+                        // Rebind repaired tool IDs.
+                        const repairedToolOnlyPayload = { tool_ids: repairedToolIds };
+                        const repairedToolOnlyResponse = await axios.patch(url, repairedToolOnlyPayload, {
+                            headers: {
+                                'Content-Type': 'application/json',
+                                ...(process.env.ELEVENLABS_API_KEY && { 'Authorization': `Bearer ${process.env.ELEVENLABS_API_KEY}` })
+                            }
+                        });
+                        console.log('[Agent PATCH] Auto-repair succeeded; rebound tool_ids:', repairedToolIds);
+                        console.log('[Agent PATCH] /prompt repaired tool-only status:', repairedToolOnlyResponse.status);
+
+                        return {
+                            ...response.data,
+                            repairedToolIds
+                        };
                     }
-                });
-                console.log('[Agent PATCH] transfer_to_number ensured via /agents endpoint');
-                console.log('[Agent PATCH] /agents ensure status:', ensureToolResponse.status);
-            } catch (ensureErr) {
-                console.error('[Agent PATCH] Failed to ensure transfer_to_number via /agents endpoint:', ensureErr?.response?.status, ensureErr?.response?.data || ensureErr?.message);
+                    console.warn('[Agent PATCH] Auto-repair could not register a new school-specific tool');
+                } catch (repairErr) {
+                    console.error('[Agent PATCH] Auto-repair failed:', repairErr?.response?.status, repairErr?.response?.data || repairErr?.message);
+                }
             }
         }
 
@@ -1921,7 +1943,18 @@ router.put('/settings', async (req, res) => {
                     console.warn('[PUT /settings] ELEVENLABS_API_URL not set — skipping agent PATCH');
                 } else {
                     try {
-                        await updateAgentWithKnowledgeBase(
+                        if (!Array.isArray(school.toolIds) || school.toolIds.length === 0) {
+                            const dynamicToolId = await registerTool(String(school._id), agentId);
+                            if (dynamicToolId) {
+                                school.toolIds = [dynamicToolId, GLOBAL_TIME_TOOL_ID];
+                                console.log('[PUT /settings] Rebuilt missing toolIds:', school.toolIds);
+                            } else {
+                                school.toolIds = [GLOBAL_TIME_TOOL_ID];
+                                console.warn('[PUT /settings] Could not rebuild school-specific tool; using global time tool only');
+                            }
+                        }
+
+                        const agentSyncResult = await updateAgentWithKnowledgeBase(
                             agentId,
                             school.script || '',
                             school.systemPrompt || '',
@@ -1931,8 +1964,13 @@ router.put('/settings', async (req, res) => {
                                 enabled: Boolean(school.enableHumanTransfer),
                                 condition: school.humanTransferCondition || '',
                                 phoneNumber: school.humanTransferPhoneNumber || ''
-                            }
+                            },
+                            school._id
                         );
+                        if (Array.isArray(agentSyncResult?.repairedToolIds) && agentSyncResult.repairedToolIds.length > 0) {
+                            school.toolIds = agentSyncResult.repairedToolIds;
+                            console.log('[PUT /settings] Stored repaired toolIds on school:', school.toolIds);
+                        }
                         console.log('[PUT /settings] Agent updated with full payload (KB and/or Persona changes)');
                     } catch (err) {
                         const status = err?.response?.status;

@@ -162,6 +162,7 @@ router.post('/register', async (req, res) => {
             const toolId = await registerTool(school._id.toString(), agentId);
             if (toolId) {
                 const globalTimeToolId = "tool_1801kmyr9pdpemts5qr0f1xys3yy";
+                school.toolIds = [toolId, globalTimeToolId];
                 // Link tools to agent (both the school-specific and global time tool)
                 await patchAgentPrompt(agentId, {
                     tool_ids: [toolId, globalTimeToolId],
@@ -404,6 +405,7 @@ router.post('/google/callback', async (req, res) => {
                 const toolId = await registerTool(school._id.toString(), agentId);
                 if (toolId) {
                     const globalTimeToolId = "tool_1801kmyr9pdpemts5qr0f1xys3yy";
+                    school.toolIds = [toolId, globalTimeToolId];
                     await patchAgentPrompt(agentId, {
                         tool_ids: [toolId, globalTimeToolId],
                         post_call_webhook_url: "https://montessori-enrollment-ai-backend.onrender.com/api/v1/webhook/elevenlabs",
@@ -518,6 +520,7 @@ router.post('/google/complete-signup', async (req, res) => {
             const toolId = await registerTool(school._id.toString(), agentId);
             if (toolId) {
                 const globalTimeToolId = "tool_1801kmyr9pdpemts5qr0f1xys3yy";
+                school.toolIds = [toolId, globalTimeToolId];
                 await patchAgentPrompt(agentId, {
                     tool_ids: [toolId, globalTimeToolId],
                     post_call_webhook_url: "https://montessori-enrollment-ai-backend.onrender.com/api/v1/webhook/elevenlabs",

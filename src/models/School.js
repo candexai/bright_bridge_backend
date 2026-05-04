@@ -38,6 +38,8 @@ const schoolSchema = new mongoose.Schema({
     enableHumanTransfer: { type: Boolean, default: false },
     humanTransferCondition: { type: String, default: '' },
     humanTransferPhoneNumber: { type: String, default: '' },
+    // Persist ElevenLabs tool IDs so later prompt updates do not clear tools.
+    toolIds: { type: [String], default: [] },
     // Analytics
     wordCloud: { type: Array, default: [] },
     // Billing / PayPal (metered minutes when billingMode === 'metered')
