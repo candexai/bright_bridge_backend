@@ -203,6 +203,7 @@ async function processTranscriptWithAI(webhookId, transcriptArray) {
                 tour_booking_detected: aiResult.tour_booking_detected,
                 tour_booking_date: aiResult.tour_booking_date,
                 tour_booking_extracted: aiResult.tour_booking_extracted,
+                comprehensive_result: aiResult.comprehensive_result || null,
                 ai_processed: true
             },
             { new: true }

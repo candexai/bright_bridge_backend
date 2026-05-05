@@ -136,6 +136,93 @@ ${combinedText}
 }
 
 /**
+ * Merge parent "asked about" items from comprehensive JSON. The model may put
+ * questions in one_pager.what_they_asked_about, top-level questions_asked, or
+ * only topics_of_interest. We must not use `||` between arrays: [] is truthy
+ * in JavaScript and would drop the other field.
+ */
+function normalizeStringList(val) {
+    if (val == null) return [];
+    if (typeof val === 'string') {
+        const t = val.trim();
+        return t ? [t] : [];
+    }
+    if (!Array.isArray(val)) return [];
+    return val
+        .map((v) => (v == null ? '' : String(v).trim()))
+        .filter(Boolean);
+}
+
+function dedupeCaseInsensitive(items) {
+    const seen = new Set();
+    const out = [];
+    for (const item of items) {
+        const key = item.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(item);
+    }
+    return out;
+}
+
+/**
+ * When structured question arrays are empty but the narrative summary describes
+ * parent intent, derive short bullets so tour cards are never misleadingly blank.
+ */
+function inferTopicsFromSummary(summaryText) {
+    const raw = String(summaryText || '').trim();
+    if (!raw) return [];
+    const lower = raw.toLowerCase();
+    if (
+        lower.includes('no meaningful interaction') ||
+        lower.includes('caller did not engage') ||
+        lower.includes('primarily consisted of greetings')
+    ) {
+        return [];
+    }
+    const sentences = raw
+        .split(/(?<=[.!?])\s+/)
+        .map((s) => s.trim())
+        .filter((s) => s.length >= 20 && s.length <= 280);
+    const topicHints =
+        /ask|want|need|look(?:ing)? for|interest|concern|curious|question|tuition|fee|price|schedule|hours|enroll|program|curriculum|meal|food|ratio|teacher|camera|security|pickup|bus|nap|after[\s-]?school/i;
+    const out = [];
+    for (const sent of sentences) {
+        if (topicHints.test(sent)) {
+            out.push(sent.replace(/\s+/g, ' '));
+        }
+        if (out.length >= 8) break;
+    }
+    return dedupeCaseInsensitive(out);
+}
+
+/**
+ * @param {object} extracted - Parsed JSON from getComprehensivePrompt
+ * @param {{ summaryText?: string }} [extra] - optional webhook summary / highlights when extracted.summary is empty
+ * @returns {string[]}
+ */
+function mergeParentQuestionsFromExtraction(extracted, extra = {}) {
+    const root = extracted && typeof extracted === 'object' ? extracted : {};
+    const fromOnePager = normalizeStringList(root.one_pager?.what_they_asked_about);
+    const fromTop = normalizeStringList(root.questions_asked);
+    const primary = dedupeCaseInsensitive([...fromOnePager, ...fromTop]);
+    if (primary.length > 0) return primary;
+    const topics = dedupeCaseInsensitive(normalizeStringList(root.topics_of_interest));
+    if (topics.length > 0) return topics;
+    const summaryText = String(root.summary || extra.summaryText || '').trim();
+    return inferTopicsFromSummary(summaryText);
+}
+
+/** Merge multiple question/topic lists (booking cache + webhook extraction). */
+function mergeQuestionLists(...lists) {
+    const flat = [];
+    for (const list of lists) {
+        flat.push(...normalizeStringList(list));
+    }
+    return dedupeCaseInsensitive(flat);
+}
+
+/**
  * Extract structured details from a call transcript using comprehensive prompt
  */
 async function extractTourDetails(transcriptText, existingDetails = {}) {
@@ -173,7 +260,7 @@ async function extractTourDetails(transcriptText, existingDetails = {}) {
             childName: extracted.child_name ? (Array.isArray(extracted.child_name) ? extracted.child_name[0] : extracted.child_name) : existingDetails.childName || '',
             childAge: extracted.child_age ? (Array.isArray(extracted.child_age) ? extracted.child_age[0] : extracted.child_age) : existingDetails.childAge || '',
             purpose: extracted.summary || existingDetails.purpose || 'Brief inquiry',
-            questionsAsked: extracted.one_pager?.what_they_asked_about || extracted.questions_asked || [],
+            questionsAsked: mergeParentQuestionsFromExtraction(extracted),
             notes: extracted.one_pager?.tour_talking_points
                 ? extracted.one_pager.tour_talking_points.join('\n')
                 : (extracted.topics_of_interest ? extracted.topics_of_interest.join(', ') : ''),
@@ -254,7 +341,7 @@ async function batchExtractTourDetails(tourBatch) {
                     childName: extracted.child_name ? (Array.isArray(extracted.child_name) ? extracted.child_name[0] : extracted.child_name) : tour.existingDetails?.childName || '',
                     childAge: extracted.child_age ? (Array.isArray(extracted.child_age) ? extracted.child_age[0] : extracted.child_age) : tour.existingDetails?.childAge || '',
                     purpose: extracted.summary || tour.existingDetails?.purpose || 'Brief inquiry',
-                    questionsAsked: extracted.one_pager?.what_they_asked_about || extracted.questions_asked || [],
+                    questionsAsked: mergeParentQuestionsFromExtraction(extracted),
                     notes: extracted.one_pager?.tour_talking_points
                         ? extracted.one_pager.tour_talking_points.join('\n')
                         : (extracted.topics_of_interest ? extracted.topics_of_interest.join(', ') : ''),
@@ -299,5 +386,7 @@ module.exports = {
     getChatCompletion,
     generateWordCloud,
     extractTourDetails,
-    batchExtractTourDetails
+    batchExtractTourDetails,
+    mergeParentQuestionsFromExtraction,
+    mergeQuestionLists
 };

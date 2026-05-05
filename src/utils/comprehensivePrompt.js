@@ -49,6 +49,8 @@ Parent questions and interests (ONLY what was explicitly asked or stated):
 
 (e.g. "school hours", "meal/food provided", "teacher-to-student ratio", "after-school care", "cameras/security", "pickup service", "nap time", "start date")
 
+MANDATORY: If the parent discussed enrollment timing, scheduling a tour, tuition, programs, hours, or any school-related topic, you MUST populate both questions_asked and topics_of_interest (use topics when they did not literally ask a question). Never leave both arrays empty when the summary describes any parent intent beyond pure greetings.
+
 - enrollment_urgency: "immediate" | "within weeks" | "specific month" | "unknown" - based on what parent said
 - enrollment_target_date: string or null (e.g. "June", "as soon as possible", "next month")
 - language_spoken: "English" | "Spanish" | "Both"

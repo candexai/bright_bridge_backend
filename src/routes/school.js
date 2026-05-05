@@ -31,7 +31,9 @@ const {
 const { getPlanDef } = require('../config/billingPlans');
 const {
     generateWordCloud,
-    extractTourDetails
+    extractTourDetails,
+    mergeParentQuestionsFromExtraction,
+    mergeQuestionLists
 } = require('../utils/openai');
 
 
@@ -875,7 +877,12 @@ router.get('/daily-insights', async (req, res) => {
                             ? `${backendUrl}/api/school/calls/${wh.conversation_id}/audio?token=${userToken}`
                             : null,
                         duration: getCallDurationSeconds(wh),
-                        questionsAsked: wh.questions_asked || [],
+                        questionsAsked: mergeQuestionLists(
+                            comprehensiveData.questionsAsked,
+                            mergeParentQuestionsFromExtraction(wh.comprehensive_result, {
+                                summaryText: wh.summary || ''
+                            })
+                        ),
                         actionTaken: wh.actionTaken || false,
                         actionTakenAt: wh.actionTakenAt || null,
                         actionTakenFeedback: wh.actionTakenFeedback || '',
@@ -901,12 +908,14 @@ router.get('/daily-insights', async (req, res) => {
 
         // First, add tours with usable cached AI insights to the map.
         todaysTourDocs.forEach(tour => {
+            const questionCount = (tour.questionsAsked || []).filter(q => String(q || '').trim()).length;
+            const hasHighlights = Boolean((tour.highlights || '').trim());
+            // Do not treat "highlights only" as complete: empty questions must be backfilled from transcript.
+            const needsQuestionBackfill = Boolean(tour.aiProcessed && hasHighlights && questionCount === 0);
             const hasUsableCachedInsights =
                 tour.aiProcessed &&
-                (
-                    (Array.isArray(tour.questionsAsked) && tour.questionsAsked.length > 0) ||
-                    Boolean((tour.highlights || '').trim())
-                );
+                !needsQuestionBackfill &&
+                (questionCount > 0 || hasHighlights);
 
             if (hasUsableCachedInsights) {
                 enrichedToursMap.set(tour._id.toString(), {
@@ -920,12 +929,13 @@ router.get('/daily-insights', async (req, res) => {
 
         // Collect all phone numbers for unprocessed tours in a single query
         const unprocessedTours = todaysTourDocs.filter(tour => {
+            const questionCount = (tour.questionsAsked || []).filter(q => String(q || '').trim()).length;
+            const hasHighlights = Boolean((tour.highlights || '').trim());
+            const needsQuestionBackfill = Boolean(tour.aiProcessed && hasHighlights && questionCount === 0);
             const hasUsableCachedInsights =
                 tour.aiProcessed &&
-                (
-                    (Array.isArray(tour.questionsAsked) && tour.questionsAsked.length > 0) ||
-                    Boolean((tour.highlights || '').trim())
-                );
+                !needsQuestionBackfill &&
+                (questionCount > 0 || hasHighlights);
             return !hasUsableCachedInsights;
         });
         const tourPhones = unprocessedTours.map(tour => normalizePhone(tour.phone)).filter(p => p);
@@ -959,10 +969,11 @@ router.get('/daily-insights', async (req, res) => {
                 .replace(/\s+/g, ' ')
                 .trim();
 
-        const usedWebhookIds = new Set();
-
-        // Process unprocessed tours using the pre-fetched webhooks
-        unprocessedTours.forEach(tour => {
+        /**
+         * Match a tour booking to the best-effort call webhook (shared for extraction + question merge).
+         * @param {Set|null} restrictUsedIds - name-based fallback skips webhooks already linked for batch extraction.
+         */
+        const linkWebhookToTour = (tour, restrictUsedIds) => {
             const tourPhone = normalizePhone(tour.phone);
             let linkedWebhook = null;
 
@@ -982,15 +993,14 @@ router.get('/daily-insights', async (req, res) => {
                 }
             }
 
-            // Fallback for transcripts without usable phone metadata:
-            // match by parent name plus nearest call time.
+            // Fallback for transcripts without usable phone metadata: match by parent name + nearest call time.
             if (!linkedWebhook) {
                 const tourName = normalizeName(tour.parentName);
                 const tourTimeMs = new Date(tour.scheduledAt).getTime();
 
                 if (tourName) {
                     const candidates = allRelevantWebhooks.filter(wh => {
-                        if (usedWebhookIds.has(String(wh._id))) return false;
+                        if (restrictUsedIds && restrictUsedIds.has(String(wh._id))) return false;
 
                         const extractedName = normalizeName(wh.comprehensive_result?.parent_name || '');
                         const summaryText = normalizeName(wh.summary || '');
@@ -1022,6 +1032,15 @@ router.get('/daily-insights', async (req, res) => {
                     }
                 }
             }
+
+            return linkedWebhook;
+        };
+
+        const usedWebhookIds = new Set();
+
+        // Process unprocessed tours using the pre-fetched webhooks
+        unprocessedTours.forEach(tour => {
+            const linkedWebhook = linkWebhookToTour(tour, usedWebhookIds);
 
             if (linkedWebhook) {
                 usedWebhookIds.add(String(linkedWebhook._id));
@@ -1098,6 +1117,13 @@ router.get('/daily-insights', async (req, res) => {
 
         const todaysTours = todaysTourDocs.map(tour => {
             const enriched = enrichedToursMap.get(tour._id.toString()) || { ...tour, id: tour._id.toString() };
+            const wh = linkWebhookToTour(tour, null);
+            const summaryForQuestions = wh?.summary || enriched.highlights || tour.highlights || '';
+            const questionsAsked = mergeQuestionLists(
+                enriched.questionsAsked,
+                mergeParentQuestionsFromExtraction(wh?.comprehensive_result, { summaryText: summaryForQuestions })
+            );
+            const linked = enriched.linkedWebhook || wh;
             return {
                 id: enriched.id,
                 parentName: enriched.parentName || 'Parent',
@@ -1108,12 +1134,12 @@ router.get('/daily-insights', async (req, res) => {
                 reason: enriched.reason || enriched.purpose || 'Enrollment Inquiry',
                 scheduledAt: enriched.scheduledAt,
                 calendarProvider: enriched.calendarProvider || null,
-                questionsAsked: enriched.questionsAsked || [],
+                questionsAsked,
                 highlights: enriched.highlights || enriched.notes || '',
-                callSummary: enriched.callSummary || '',
+                callSummary: enriched.callSummary || wh?.summary || '',
                 reminderSent: enriched.reminderSent || false,
-                tags: Array.isArray(enriched.linkedWebhook?.extractedTags) ? enriched.linkedWebhook.extractedTags : [],
-                language: enriched.linkedWebhook?.extractedLanguage || '',
+                tags: Array.isArray(linked?.extractedTags) ? linked.extractedTags : [],
+                language: linked?.extractedLanguage || '',
             };
         });
 
@@ -1224,7 +1250,12 @@ router.get('/action-needed', async (req, res) => {
                     ? `${backendUrl}/api/school/calls/${wh.conversation_id}/audio?token=${userToken}`
                     : null,
                 duration: getCallDurationSeconds(wh),
-                questionsAsked: wh.questions_asked || [],
+                questionsAsked: mergeQuestionLists(
+                    comprehensiveData.questionsAsked,
+                    mergeParentQuestionsFromExtraction(wh.comprehensive_result, {
+                        summaryText: wh.summary || ''
+                    })
+                ),
                 actionTakenFeedback: wh.actionTakenFeedback || undefined,
                 actionTakenAt: wh.actionTakenAt || undefined,
                 feedbackHistory: wh.feedbackHistory || undefined,

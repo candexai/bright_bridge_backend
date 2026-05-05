@@ -15,6 +15,7 @@ const elevenLabsWebhookSchema = new mongoose.Schema({
     received_at: { type: Date, default: Date.now },
     // AI-processed fields
     summary: { type: String, default: '' }, // OpenAI-generated summary
+    comprehensive_result: { type: mongoose.Schema.Types.Mixed, default: null }, // full structured extraction (questions, one_pager, etc.)
     tour_booking_detected: { type: Boolean, default: false }, // whether a tour booking was detected
     tour_booking_date: { type: Date, default: null }, // extracted tour booking date/time
     tour_booking_extracted: { type: mongoose.Schema.Types.Mixed, default: null }, // full extracted booking info
