@@ -16,7 +16,12 @@ const AiNumberRequest = require('../models/AiNumberRequest');
 const BillingTransaction = require('../models/BillingTransaction');
 const MinuteLedger = require('../models/MinuteLedger');
 const { authMiddleware, adminOnly } = require('../middleware/auth');
-const { importSipTrunk, deletePhoneNumber, updatePhoneNumber, patchAgentPrompt, APPOINTMENT_AGENT_PROMPT } = require('../utils/elevenlabs');
+const {
+    importSipTrunk,
+    deletePhoneNumber,
+    updatePhoneNumber,
+    patchAgentPromptContent,
+} = require('../utils/elevenlabs');
 const { aiNumberAssignmentPatch, normalizeAiDigits } = require('../utils/aiNumberOwnership');
 
 const router = express.Router();
@@ -894,9 +899,16 @@ router.post('/schools/:id/assign-number', async (req, res) => {
 
 // POST /api/admin/schools/:id/agent-prompt - Update first message/system prompt and sync ElevenLabs
 router.post('/schools/:id/agent-prompt', async (req, res) => {
+    const startedAt = new Date().toISOString();
     try {
         const { id } = req.params;
         const { script, systemPrompt } = req.body || {};
+
+        console.log('[Admin Agent Prompt] ========== REQUEST ==========');
+        console.log('[Admin Agent Prompt] startedAt:', startedAt);
+        console.log('[Admin Agent Prompt] schoolId:', id);
+        console.log('[Admin Agent Prompt] body.script length:', script !== undefined ? String(script).length : 'unchanged');
+        console.log('[Admin Agent Prompt] body.systemPrompt length:', systemPrompt !== undefined ? String(systemPrompt).length : 'unchanged');
 
         const school = await School.findById(id);
         if (!school) {
@@ -907,40 +919,47 @@ router.post('/schools/:id/agent-prompt', async (req, res) => {
         const nextSystemPrompt = systemPrompt !== undefined ? String(systemPrompt) : String(school.systemPrompt || '');
         const agentId = (school.elevenlabsAgentId || '').trim();
 
+        console.log('[Admin Agent Prompt] school.name:', school.name);
+        console.log('[Admin Agent Prompt] school.elevenlabsAgentId:', agentId || '(empty)');
+        console.log('[Admin Agent Prompt] ELEVENLABS_API_URL:', process.env.ELEVENLABS_API_URL || '(not set)');
+        console.log('[Admin Agent Prompt] nextScript preview:', nextScript.slice(0, 120));
+        console.log('[Admin Agent Prompt] nextSystemPrompt preview:', nextSystemPrompt.slice(0, 120));
+
         if (!agentId) {
             return res.status(400).json({ error: 'This school has no ElevenLabs Agent ID configured.' });
         }
 
-        const fullPrompt = `${nextSystemPrompt}\n\n${APPOINTMENT_AGENT_PROMPT}`;
-        const patchPayload = {
-            first_message: nextScript,
-            system_prompt: fullPrompt,
-            language: 'en',
-            knowledge_base_ids: school.knowledgeBaseDocumentId ? [school.knowledgeBaseDocumentId] : [],
-            enable_human_transfer: Boolean(school.enableHumanTransfer),
-        };
-
-        if (school.enableHumanTransfer && school.humanTransferCondition && school.humanTransferPhoneNumber) {
-            patchPayload.human_transfer_rules = [{
-                condition: school.humanTransferCondition,
-                phone_number: school.humanTransferPhoneNumber,
-                transfer_type: 'sip_refer',
-            }];
-        }
-
-        const patched = await patchAgentPrompt(agentId, patchPayload);
-        if (!patched) {
-            return res.status(502).json({ error: 'Failed to patch ElevenLabs agent prompt. Check server logs for API error details.' });
+        const syncResult = await patchAgentPromptContent(agentId, {
+            firstMessage: nextScript,
+            systemPrompt: nextSystemPrompt,
+            knowledgeBaseId: school.knowledgeBaseDocumentId || '',
+        });
+        if (!syncResult) {
+            return res.status(502).json({ error: 'Failed to patch ElevenLabs agent. Check server logs for API error details.' });
         }
 
         school.script = nextScript;
         school.systemPrompt = nextSystemPrompt;
         await school.save();
 
-        res.json({ success: true, message: 'Agent prompt updated successfully.' });
+        console.log('[Admin Agent Prompt] MongoDB saved script + systemPrompt for school:', school.name);
+        console.log('[Admin Agent Prompt] ========== SUCCESS ==========');
+
+        res.json({
+            success: true,
+            message: 'Agent prompt updated successfully.',
+            schoolName: school.name,
+            agentId,
+            agentsUrl: syncResult.agentsUrl,
+            verifyFirstMessageChanged: syncResult.verifyFirstMessageChanged,
+            verifyMatchesExpected: syncResult.verifyMatchesExpected,
+        });
     } catch (err) {
+        console.error('[Admin Agent Prompt] ========== FAILED ==========');
         console.error('Admin agent prompt update error:', err);
-        res.status(500).json({ error: 'Internal server error' });
+        const status = err?.response?.status || err?.statusCode || 500;
+        const detail = err?.response?.data?.detail || err?.message || 'Internal server error';
+        res.status(status >= 400 && status < 600 ? status : 500).json({ error: String(detail) });
     }
 });
 

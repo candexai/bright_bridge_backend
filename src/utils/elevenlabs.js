@@ -397,11 +397,6 @@ async function createSchoolAgent(schoolName, knowledgeBaseId = null, toolIds = [
         const personaPrompt = NORA_SYSTEM_PROMPT_TEMPLATE.replace(/{{SCHOOL_NAME}}/g, schoolName);
         const fullPrompt = `${personaPrompt}\n\n${APPOINTMENT_AGENT_PROMPT}`;
 
-        // Ensure global time tool is included if any tools are passed, or as default
-        const finalToolIds = Array.isArray(toolIds) && toolIds.length > 0
-            ? [...new Set([...toolIds, GLOBAL_TIME_TOOL_ID])]
-            : [GLOBAL_TIME_TOOL_ID];
-
         const payload = {
             name: schoolName,
             first_message: DEFAULT_FIRST_MESSAGE_TEMPLATE.replace(/{{SCHOOL_NAME}}/g, schoolName),
@@ -410,10 +405,15 @@ async function createSchoolAgent(schoolName, knowledgeBaseId = null, toolIds = [
             speed: 0.95,
             system_prompt: fullPrompt,
             knowledge_base_ids: knowledgeBaseId ? [knowledgeBaseId] : [],
-            tool_ids: finalToolIds,
             voice_id: "jqcCZkN6Knx8BJ5TBdYR",// Default voice
             post_call_webhook_url: "https://montessori-enrollment-ai-backend.onrender.com/api/v1/webhook/elevenlabs",
         };
+
+        // Only set tool_ids at create when explicitly provided. Registration uses
+        // register-tool (attaches tools) then linkAgentToolIds to avoid tools + tool_ids conflict.
+        if (Array.isArray(toolIds) && toolIds.length > 0) {
+            payload.tool_ids = [...new Set([...toolIds, GLOBAL_TIME_TOOL_ID])];
+        }
 
         console.log(`[Agent Create] POST ${url}`);
         console.log(`[Agent Create] Payload:`, JSON.stringify(payload, null, 2));
@@ -628,33 +628,520 @@ async function ingestKnowledgeBaseDocument(text, schoolName) {
     }
 }
 
-async function patchAgentPrompt(agentId, payload) {
+function normalizeToolIds(toolIds) {
+    const ids = Array.isArray(toolIds)
+        ? toolIds.filter(Boolean).map((id) => String(id).trim()).filter(Boolean)
+        : [];
+    return [...new Set([...ids, GLOBAL_TIME_TOOL_ID])];
+}
+
+function isToolsToolIdsConflict(err) {
+    const detail = JSON.stringify(err?.response?.data || {});
+    return err?.response?.status === 400 && /both tools and tool IDs/i.test(detail);
+}
+
+function elevenLabsHeaders() {
+    return {
+        'Content-Type': 'application/json',
+        ...(process.env.ELEVENLABS_API_KEY && { Authorization: `Bearer ${process.env.ELEVENLABS_API_KEY}` }),
+    };
+}
+
+function resolveAgentBranchId(snapshot) {
+    if (!snapshot) return null;
+    return snapshot.branch_id || snapshot.main_branch_id || null;
+}
+
+function agentsUrlFor(baseUrl, agentId, branchId = null) {
+    let url = `${baseUrl}/api/v1/agents/${agentId}`;
+    if (branchId) {
+        url += `?branch_id=${encodeURIComponent(branchId)}`;
+    }
+    return url;
+}
+
+function promptUrlFor(baseUrl, agentId, branchId = null) {
+    return `${agentsUrlFor(baseUrl, agentId, branchId)}/prompt`;
+}
+
+/** Read agent fields from nested conversation_config (ElevenLabs native) or flat wrapper shape. */
+function extractConversationAgent(snapshot) {
+    if (!snapshot) return {};
+    const nested = snapshot.conversation_config?.agent;
+    if (nested && typeof nested === 'object') {
+        return nested;
+    }
+    return {
+        first_message: snapshot.first_message,
+        language: snapshot.language,
+        prompt: {
+            prompt: snapshot.system_prompt,
+            tool_ids: snapshot.tool_ids,
+        },
+    };
+}
+
+function getAgentFirstMessage(snapshot) {
+    const agent = extractConversationAgent(snapshot);
+    return agent.first_message ?? snapshot?.first_message ?? '';
+}
+
+function getAgentPromptText(snapshot) {
+    const agent = extractConversationAgent(snapshot);
+    return agent.prompt?.prompt ?? snapshot?.system_prompt ?? '';
+}
+
+function normalizePromptForCompare(text) {
+    return String(text || '').replace(/\r\n/g, '\n').trim();
+}
+
+/** PATCH /agents/:id/prompt — tool_ids only (registration repair path). */
+function buildPromptSubresourcePayload({ fullPrompt, knowledgeBaseId }) {
+    const kbId = knowledgeBaseId && String(knowledgeBaseId).trim();
+    return {
+        system_prompt: fullPrompt,
+        knowledge_base_ids: kbId ? [kbId] : [],
+        language: 'en',
+    };
+}
+
+/** PATCH /agents/:id — conversation_config.agent.prompt (ElevenLabs UI source of truth). */
+function buildSystemPromptAgentsPayload(fullPrompt, knowledgeBaseId, existingAgent = {}) {
+    const existingPrompt = existingAgent?.prompt || {};
+    const prompt = {
+        llm: existingPrompt.llm || 'gemini-2.5-flash',
+        prompt: fullPrompt,
+    };
+    if (Array.isArray(existingPrompt.tool_ids) && existingPrompt.tool_ids.length > 0) {
+        prompt.tool_ids = existingPrompt.tool_ids;
+    }
+
+    const kbId = knowledgeBaseId && String(knowledgeBaseId).trim();
+    if (kbId) {
+        const existingKb = Array.isArray(existingPrompt.knowledge_base)
+            ? existingPrompt.knowledge_base.find((doc) => doc?.id === kbId)
+            : null;
+        // ElevenLabs requires type, id, and name on each knowledge_base entry.
+        prompt.knowledge_base = [{
+            type: existingKb?.type || 'file',
+            id: kbId,
+            name: existingKb?.name || 'School knowledge base',
+            usage_mode: existingKb?.usage_mode || 'auto',
+        }];
+    }
+
+    return {
+        conversation_config: {
+            agent: { prompt },
+        },
+    };
+}
+
+function buildFirstMessageAgentsPayload(firstMessage) {
+    return {
+        conversation_config: {
+            agent: {
+                first_message: firstMessage || '',
+            },
+        },
+    };
+}
+
+function logElevenLabsExchange(label, { method, url, payload, response, error }) {
+    const preview = (text, max = 400) => {
+        const s = String(text || '');
+        return s.length > max ? `${s.slice(0, max)}… (${s.length} chars)` : s;
+    };
+    console.log(`[ElevenLabs] ========== ${label} ==========`);
+    console.log(`[ElevenLabs] ${method} ${url}`);
+    if (payload) {
+        const nestedPrompt = payload?.conversation_config?.agent?.prompt?.prompt;
+        console.log('[ElevenLabs] Request payload:', JSON.stringify({
+            ...payload,
+            system_prompt: payload.system_prompt
+                ? preview(payload.system_prompt, 500)
+                : payload.system_prompt,
+            conversation_config: payload.conversation_config
+                ? {
+                    ...payload.conversation_config,
+                    agent: payload.conversation_config.agent
+                        ? {
+                            ...payload.conversation_config.agent,
+                            prompt: payload.conversation_config.agent.prompt
+                                ? {
+                                    ...payload.conversation_config.agent.prompt,
+                                    prompt: nestedPrompt
+                                        ? preview(nestedPrompt, 500)
+                                        : payload.conversation_config.agent.prompt.prompt,
+                                }
+                                : undefined,
+                        }
+                        : undefined,
+                }
+                : payload.conversation_config,
+        }, null, 2));
+    }
+    if (response) {
+        console.log(`[ElevenLabs] Response status: ${response.status}`);
+        const data = response.data;
+        console.log('[ElevenLabs] Response data:', JSON.stringify(data, null, 2));
+    }
+    if (error) {
+        console.log(`[ElevenLabs] Error status: ${error?.response?.status}`);
+        console.log('[ElevenLabs] Error data:', JSON.stringify(error?.response?.data || {}, null, 2));
+        console.log('[ElevenLabs] Error message:', error.message);
+    }
+    console.log(`[ElevenLabs] ========== end ${label} ==========`);
+}
+
+async function fetchAgentSnapshot(agentId, label = 'GET agent', branchId = null) {
     const baseUrl = process.env.ELEVENLABS_API_URL;
-    if (!baseUrl) {
-        console.warn('[Agent Patch Prompt] ELEVENLABS_API_URL not configured');
+    if (!baseUrl || !agentId) return null;
+    const url = agentsUrlFor(baseUrl, agentId, branchId);
+    try {
+        const response = await axios.get(url, { headers: elevenLabsHeaders() });
+        logElevenLabsExchange(label, { method: 'GET', url, response });
+        return response.data;
+    } catch (err) {
+        logElevenLabsExchange(`${label} (failed)`, { method: 'GET', url, error: err });
+        return null;
+    }
+}
+
+/**
+ * Set agent tools by ID only. register-tool attaches full tool objects first;
+ * we normalize to tool_ids via /agents (preferred) then /prompt.
+ */
+async function linkAgentToolIds(agentId, toolIds, { branchId = null } = {}) {
+    const baseUrl = process.env.ELEVENLABS_API_URL;
+    if (!baseUrl || !agentId) {
+        console.warn('[Agent Link Tools] ELEVENLABS_API_URL or agentId not configured');
         return null;
     }
 
+    const finalToolIds = normalizeToolIds(toolIds);
+    const agentsUrl = agentsUrlFor(baseUrl, agentId, branchId);
+    const promptUrl = `${agentsUrl}/prompt`;
+    const agentsPayload = {
+        conversation_config: {
+            agent: {
+                prompt: {
+                    tool_ids: finalToolIds,
+                    // Clear inline tools left by register-tool so /prompt updates do not 400.
+                    tools: [],
+                    built_in_tools: {
+                        transfer_to_number: null,
+                    },
+                },
+            },
+        },
+    };
+    const promptPayload = { tool_ids: finalToolIds };
+
+    console.log('[Agent Link Tools] agent:', agentId, 'tool_ids:', finalToolIds);
+
+    // Prefer /agents — avoids conflicting with inline tools left by register-tool.
     try {
-        const url = `${baseUrl}/api/v1/agents/${agentId}/prompt`;
-        console.log(`[Agent Patch] PATCH ${url}`);
-        console.log(`[Agent Patch Prompt] Payload:`, JSON.stringify(payload, null, 2));
+        const response = await axios.patch(agentsUrl, agentsPayload, { headers: elevenLabsHeaders() });
+        console.log('[Agent Link Tools] /agents status:', response.status);
+        return response.data;
+    } catch (agentsErr) {
+        if (!isToolsToolIdsConflict(agentsErr)) {
+            console.warn('[Agent Link Tools] /agents failed:', agentsErr.response?.status, agentsErr.response?.data || agentsErr.message);
+        }
+    }
 
+    try {
+        const response = await axios.patch(promptUrl, promptPayload, { headers: elevenLabsHeaders() });
+        console.log('[Agent Link Tools] /prompt status:', response.status);
+        return response.data;
+    } catch (promptErr) {
+        console.error('[Agent Link Tools] Failed for agent', agentId);
+        console.error('[Agent Link Tools] Error Status:', promptErr.response?.status);
+        console.error('[Agent Link Tools] Error Data:', JSON.stringify(promptErr.response?.data || {}, null, 2));
+        if (isToolsToolIdsConflict(promptErr)) {
+            console.warn(
+                '[Agent Link Tools] register-tool already attached tools on this agent; '
+                + 'tool_ids could not be set. Voice agent may still work — fix agent in ElevenLabs or recreate the school.'
+            );
+        }
+        return null;
+    }
+}
 
-        const response = await axios.patch(url, payload, {
-            headers: {
-                'Content-Type': 'application/json',
-                ...(process.env.ELEVENLABS_API_KEY && { 'Authorization': `Bearer ${process.env.ELEVENLABS_API_KEY}` })
-            }
-        });
+/**
+ * PATCH /agents/:id — system prompt only (conversation_config.agent.prompt.prompt).
+ */
+async function patchAgentSystemPrompt(agentId, fullPrompt, knowledgeBaseId = '', {
+    branchId = null,
+    label = 'PATCH /agents system_prompt',
+    existingAgent = null,
+} = {}) {
+    const baseUrl = process.env.ELEVENLABS_API_URL;
+    if (!baseUrl || !agentId) {
+        console.warn('[Agent Patch System Prompt] ELEVENLABS_API_URL or agentId not configured');
+        return null;
+    }
 
-        console.log(`[Agent Patch Prompt] Status: ${response.status}`);
-        console.log(`[Agent Patch Prompt] Response:`, JSON.stringify(response.data, null, 2));
+    let agentConfig = existingAgent;
+    if (!agentConfig) {
+        const snapshot = await fetchAgentSnapshot(agentId, 'load agent for system_prompt', branchId);
+        agentConfig = extractConversationAgent(snapshot);
+    }
+
+    const url = agentsUrlFor(baseUrl, agentId, branchId);
+    const payload = buildSystemPromptAgentsPayload(fullPrompt, knowledgeBaseId, agentConfig);
+    try {
+        const response = await axios.patch(url, payload, { headers: elevenLabsHeaders() });
+        logElevenLabsExchange(label, { method: 'PATCH', url, payload, response });
         return response.data;
     } catch (err) {
-        console.error(`[Agent Patch Prompt] Failed to patch agent ${agentId}`);
-        console.error(`[Agent Patch Prompt] Error Status:`, err.response?.status);
-        console.error(`[Agent Patch Prompt] Error Data:`, JSON.stringify(err.response?.data || {}, null, 2));
+        const detail = JSON.stringify(err?.response?.data || {});
+        if (err?.response?.status === 400 && /field required/i.test(detail)) {
+            console.warn('[Agent Patch System Prompt] nested PATCH failed — retry via /prompt');
+            const fallback = buildPromptSubresourcePayload({ fullPrompt, knowledgeBaseId });
+            return patchAgentPrompt(agentId, fallback, { branchId, label: `${label} (/prompt fallback)` });
+        }
+        logElevenLabsExchange(`${label} (failed)`, { method: 'PATCH', url, payload, error: err });
+        throw err;
+    }
+}
+
+/**
+ * PATCH /agents/:id — first_message only (lives on conversation_config.agent, not /prompt).
+ */
+async function patchAgentFirstMessage(agentId, firstMessage, { branchId = null, label = 'PATCH /agents first_message' } = {}) {
+    const baseUrl = process.env.ELEVENLABS_API_URL;
+    if (!baseUrl || !agentId) {
+        console.warn('[Agent Patch First Message] ELEVENLABS_API_URL or agentId not configured');
+        return null;
+    }
+
+    const url = agentsUrlFor(baseUrl, agentId, branchId);
+    const payload = buildFirstMessageAgentsPayload(firstMessage);
+    try {
+        const response = await axios.patch(url, payload, { headers: elevenLabsHeaders() });
+        logElevenLabsExchange(label, { method: 'PATCH', url, payload, response });
+        return response.data;
+    } catch (err) {
+        logElevenLabsExchange(`${label} (failed)`, { method: 'PATCH', url, payload, error: err });
+        throw err;
+    }
+}
+
+/**
+ * PATCH /agents/:id/prompt — system prompt + KB. Never send tool_ids or first_message here.
+ */
+async function patchAgentPrompt(agentId, payload, { branchId = null, label = 'PATCH /prompt' } = {}) {
+    const baseUrl = process.env.ELEVENLABS_API_URL;
+    if (!baseUrl || !agentId) {
+        console.warn('[Agent Patch Prompt] ELEVENLABS_API_URL or agentId not configured');
+        return null;
+    }
+
+    const url = promptUrlFor(baseUrl, agentId, branchId);
+    try {
+        const response = await axios.patch(url, payload, { headers: elevenLabsHeaders() });
+        logElevenLabsExchange(label, { method: 'PATCH', url, payload, response });
+        return response.data;
+    } catch (err) {
+        logElevenLabsExchange(`${label} (failed)`, { method: 'PATCH', url, payload, error: err });
+        throw err;
+    }
+}
+
+/**
+ * Admin: system prompt via PATCH /agents (prompt.prompt); greeting via PATCH /agents (first_message).
+ */
+async function patchAgentPromptContent(agentId, {
+    firstMessage = '',
+    systemPrompt = '',
+    knowledgeBaseId = '',
+} = {}) {
+    const baseUrl = process.env.ELEVENLABS_API_URL;
+    if (!baseUrl || !agentId) {
+        console.warn('[Agent Prompt Content] missing ELEVENLABS_API_URL or agentId');
+        return null;
+    }
+
+    const baseSystem = String(systemPrompt || '').trim();
+    const fullPrompt = baseSystem.includes('EXECUTION ORDER')
+        ? baseSystem
+        : `${baseSystem}\n\n${APPOINTMENT_AGENT_PROMPT}`;
+
+    console.log('[Agent Prompt Content] agentId:', agentId);
+    console.log('[Agent Prompt Content] PATCH /agents (prompt.prompt + first_message), no tools');
+
+    const before = await fetchAgentSnapshot(agentId, 'BEFORE patch');
+    const branchId = resolveAgentBranchId(before);
+    const agentsUrl = agentsUrlFor(baseUrl, agentId, branchId);
+    if (branchId) {
+        console.log('[Agent Prompt Content] branch_id:', branchId);
+    }
+
+    const existingAgent = extractConversationAgent(before);
+    const promptPatchResponse = await patchAgentSystemPrompt(agentId, fullPrompt, knowledgeBaseId, {
+        branchId,
+        label: 'admin system_prompt',
+        existingAgent,
+    });
+
+    const firstMessagePatchResponse = await patchAgentFirstMessage(agentId, firstMessage, {
+        branchId,
+        label: 'admin first_message',
+    });
+
+    const after = await fetchAgentSnapshot(agentId, 'AFTER patch', branchId);
+    const beforeMsg = getAgentFirstMessage(before);
+    const afterMsg = getAgentFirstMessage(after);
+    const beforePrompt = getAgentPromptText(before);
+    const afterPrompt = getAgentPromptText(after);
+    const expectedMsg = firstMessage || '';
+    const verifyFirstMessageChanged = afterMsg !== beforeMsg;
+    const verifyFirstMessageMatches = afterMsg.trim() === expectedMsg.trim();
+    const verifyPromptChanged = normalizePromptForCompare(afterPrompt) !== normalizePromptForCompare(beforePrompt);
+    const verifyPromptMatches = normalizePromptForCompare(afterPrompt) === normalizePromptForCompare(fullPrompt);
+    const verifyChanged = verifyFirstMessageChanged || verifyPromptChanged;
+    const verifyMatches = verifyFirstMessageMatches && verifyPromptMatches;
+
+    console.log('[Agent Prompt Content] verify first_message changed:', verifyFirstMessageChanged);
+    console.log('[Agent Prompt Content] verify first_message matches:', verifyFirstMessageMatches);
+    console.log('[Agent Prompt Content] verify system_prompt changed:', verifyPromptChanged);
+    console.log('[Agent Prompt Content] verify system_prompt matches:', verifyPromptMatches);
+    console.log('[Agent Prompt Content] BEFORE greeting:', (beforeMsg || '').slice(0, 120));
+    console.log('[Agent Prompt Content] AFTER greeting:', (afterMsg || '').slice(0, 120));
+    console.log('[Agent Prompt Content] EXPECTED greeting:', expectedMsg.slice(0, 120));
+
+    return {
+        patchResponse: { prompt: promptPatchResponse, firstMessage: firstMessagePatchResponse },
+        agentId,
+        agentsUrl,
+        verifyFirstMessageChanged,
+        verifyMatchesExpected: verifyMatches,
+        verifyFirstMessageMatches,
+        verifyPromptMatches,
+        beforeSnapshot: before,
+        afterSnapshot: after,
+    };
+}
+
+/**
+ * School settings: prompt/KB via PATCH /prompt; human transfer via PATCH /agents built_in_tools.
+ * Does not touch tools (those are set once at registration).
+ */
+async function syncSchoolAgent(agentId, {
+    firstMessage = '',
+    systemPrompt = '',
+    knowledgeBaseId = '',
+    humanTransfer = { enabled: false, condition: '', phoneNumber: '' },
+} = {}) {
+    const baseUrl = process.env.ELEVENLABS_API_URL;
+    if (!baseUrl || !agentId) {
+        return null;
+    }
+
+    const fullPrompt = `${systemPrompt || ''}\n\n${APPOINTMENT_AGENT_PROMPT}`;
+    const transferOn = Boolean(
+        humanTransfer?.enabled && humanTransfer?.condition && humanTransfer?.phoneNumber
+    );
+
+    const before = await fetchAgentSnapshot(agentId, 'sync before');
+    const branchId = resolveAgentBranchId(before);
+    if (branchId) {
+        console.log('[Agent Sync] branch_id:', branchId);
+    }
+
+    console.log('[Agent Sync] PATCH /agents (prompt.prompt + first_message), no tools');
+    const promptPatchResponse = await patchAgentSystemPrompt(agentId, fullPrompt, knowledgeBaseId, {
+        branchId,
+        label: 'settings system_prompt',
+        existingAgent: extractConversationAgent(before),
+    });
+    const firstMessagePatchResponse = await patchAgentFirstMessage(agentId, firstMessage, {
+        branchId,
+        label: 'settings first_message',
+    });
+    const patchResponse = { prompt: promptPatchResponse, firstMessage: firstMessagePatchResponse };
+
+    const transferResult = await patchAgentHumanTransfer(agentId, humanTransfer, { branchId });
+    if (transferOn && !transferResult) {
+        const err = new Error('Prompt saved but human transfer failed to sync to ElevenLabs (built_in_tools).');
+        err.statusCode = 502;
+        throw err;
+    }
+    if (!transferOn) {
+        console.log('[Agent Sync] human transfer disabled on agent');
+    } else {
+        console.log('[Agent Sync] human transfer synced via built_in_tools.transfer_to_number');
+    }
+
+    return patchResponse;
+}
+
+async function patchAgentHumanTransfer(agentId, humanTransfer, { branchId = null } = {}) {
+    const baseUrl = process.env.ELEVENLABS_API_URL;
+    if (!baseUrl || !agentId) {
+        return null;
+    }
+
+    const enabled = Boolean(humanTransfer?.enabled && humanTransfer?.condition && humanTransfer?.phoneNumber);
+    const transferToolConfig = enabled
+        ? {
+            type: 'system',
+            name: 'transfer_to_number',
+            response_timeout_secs: 20,
+            disable_interruptions: false,
+            force_pre_tool_speech: false,
+            pre_tool_speech: 'auto',
+            assignments: [],
+            tool_call_sound: null,
+            tool_call_sound_behavior: 'auto',
+            tool_error_handling_mode: 'auto',
+            params: {
+                system_tool_type: 'transfer_to_number',
+                transfers: [{
+                    custom_sip_headers: [],
+                    transfer_destination: {
+                        type: 'phone',
+                        phone_number: humanTransfer.phoneNumber
+                    },
+                    transfer_type: 'sip_refer',
+                    post_dial_digits: null,
+                    phone_number: humanTransfer.phoneNumber,
+                    condition: humanTransfer.condition
+                }],
+                enable_client_message: true
+            }
+        }
+        : null;
+
+    try {
+        const url = agentsUrlFor(baseUrl, agentId, branchId);
+        const payload = {
+            conversation_config: {
+                agent: {
+                    prompt: {
+                        built_in_tools: {
+                            transfer_to_number: transferToolConfig,
+                        },
+                    },
+                },
+            },
+        };
+        console.log('[Agent Human Transfer] PATCH /agents built_in_tools.transfer_to_number', enabled ? 'enabled' : 'disabled');
+        if (enabled) {
+            console.log('[Agent Human Transfer] condition:', humanTransfer.condition);
+            console.log('[Agent Human Transfer] phone:', humanTransfer.phoneNumber);
+        }
+
+        const response = await axios.patch(url, payload, { headers: elevenLabsHeaders() });
+        console.log('[Agent Human Transfer] status:', response.status);
+        return response.data;
+    } catch (err) {
+        console.error('[Agent Human Transfer] failed:', err.response?.status, JSON.stringify(err.response?.data || {}));
+        if (isToolsToolIdsConflict(err)) {
+            console.error('[Agent Human Transfer] cannot set built_in_tools while agent uses tool_ids in the same prompt config');
+        }
         return null;
     }
 }
@@ -666,6 +1153,14 @@ module.exports = {
     updatePhoneNumber,
     registerTool,
     patchAgentPrompt,
+    patchAgentSystemPrompt,
+    patchAgentFirstMessage,
+    linkAgentToolIds,
+    syncSchoolAgent,
+    patchAgentPromptContent,
+    patchAgentHumanTransfer,
+    normalizeToolIds,
+    isToolsToolIdsConflict,
     formatQAPairsForKB,
     ingestKnowledgeBaseDocument,
     APPOINTMENT_AGENT_PROMPT,

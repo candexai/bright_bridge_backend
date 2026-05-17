@@ -9,7 +9,8 @@ const { authMiddleware } = require('../middleware/auth');
 const {
     createSchoolAgent,
     registerTool,
-    patchAgentPrompt,
+    linkAgentToolIds,
+    GLOBAL_TIME_TOOL_ID,
     formatQAPairsForKB,
     ingestKnowledgeBaseDocument,
     NORA_SYSTEM_PROMPT_TEMPLATE,
@@ -161,15 +162,16 @@ router.post('/register', async (req, res) => {
             // Register booked-slots tool
             const toolId = await registerTool(school._id.toString(), agentId);
             if (toolId) {
-                const globalTimeToolId = "tool_1801kmyr9pdpemts5qr0f1xys3yy";
-                school.toolIds = [toolId, globalTimeToolId];
-                // Link tools to agent (both the school-specific and global time tool)
-                await patchAgentPrompt(agentId, {
-                    tool_ids: [toolId, globalTimeToolId],
-                    post_call_webhook_url: "https://montessori-enrollment-ai-backend.onrender.com/api/v1/webhook/elevenlabs",
-                    voice_id: "jqcCZkN6Knx8BJ5TBdYR",
-                });
-                console.log(`[Register] Tools linked to Agent ${agentId}:`, [toolId, globalTimeToolId]);
+                school.toolIds = [toolId, GLOBAL_TIME_TOOL_ID];
+                const linked = await linkAgentToolIds(agentId, school.toolIds);
+                if (linked) {
+                    console.log(`[Register] Tools linked to agent ${agentId}:`, school.toolIds);
+                } else {
+                    console.warn(
+                        `[Register] Stored tool IDs ${school.toolIds.join(', ')} but ElevenLabs link failed for ${agentId}. `
+                        + 'Restart the backend if you still see [Agent Patch Prompt] logs (old code).'
+                    );
+                }
             }
 
             await school.save();
@@ -404,13 +406,8 @@ router.post('/google/callback', async (req, res) => {
                 // Register booked-slots tool
                 const toolId = await registerTool(school._id.toString(), agentId);
                 if (toolId) {
-                    const globalTimeToolId = "tool_1801kmyr9pdpemts5qr0f1xys3yy";
-                    school.toolIds = [toolId, globalTimeToolId];
-                    await patchAgentPrompt(agentId, {
-                        tool_ids: [toolId, globalTimeToolId],
-                        post_call_webhook_url: "https://montessori-enrollment-ai-backend.onrender.com/api/v1/webhook/elevenlabs",
-                        voice_id: "jqcCZkN6Knx8BJ5TBdYR",
-                    });
+                    school.toolIds = [toolId, GLOBAL_TIME_TOOL_ID];
+                    await linkAgentToolIds(agentId, school.toolIds);
                 }
 
                 await school.save();
@@ -519,13 +516,8 @@ router.post('/google/complete-signup', async (req, res) => {
             // Register booked-slots tool
             const toolId = await registerTool(school._id.toString(), agentId);
             if (toolId) {
-                const globalTimeToolId = "tool_1801kmyr9pdpemts5qr0f1xys3yy";
-                school.toolIds = [toolId, globalTimeToolId];
-                await patchAgentPrompt(agentId, {
-                    tool_ids: [toolId, globalTimeToolId],
-                    post_call_webhook_url: "https://montessori-enrollment-ai-backend.onrender.com/api/v1/webhook/elevenlabs",
-                    voice_id: "jqcCZkN6Knx8BJ5TBdYR",
-                });
+                school.toolIds = [toolId, GLOBAL_TIME_TOOL_ID];
+                await linkAgentToolIds(agentId, school.toolIds);
             }
 
             await school.save();
