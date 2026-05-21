@@ -16,8 +16,9 @@ const {
     GLOBAL_TIME_TOOL_ID,
     formatQAPairsForKB,
     ingestKnowledgeBaseDocument,
-    NORA_SYSTEM_PROMPT_TEMPLATE, 
-    DEFAULT_FIRST_MESSAGE_TEMPLATE 
+    NORA_SYSTEM_PROMPT_TEMPLATE,
+    DEFAULT_FIRST_MESSAGE_TEMPLATE,
+    HUMAN_TRANSFER_TOOL_CONDITION,
 } = require('../utils/elevenlabs');
 
 const router = express.Router();
@@ -277,7 +278,8 @@ router.post('/refer/:code/register', async (req, res) => {
             elevenlabsAgentId: process.env.DEFAULT_ELEVENLABS_AGENT_ID || '',
             status: 'active',
             systemPrompt: defaultSystemPrompt,
-            script: defaultFirstMessage
+            script: defaultFirstMessage,
+            humanTransferCondition: HUMAN_TRANSFER_TOOL_CONDITION,
         });
 
         // Generate Knowledge Base for the school (if any qaPairs exist)

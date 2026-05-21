@@ -14,7 +14,8 @@ const {
     formatQAPairsForKB,
     ingestKnowledgeBaseDocument,
     NORA_SYSTEM_PROMPT_TEMPLATE,
-    DEFAULT_FIRST_MESSAGE_TEMPLATE
+    DEFAULT_FIRST_MESSAGE_TEMPLATE,
+    HUMAN_TRANSFER_TOOL_CONDITION,
 } = require('../utils/elevenlabs');
 
 const router = express.Router();
@@ -138,7 +139,8 @@ router.post('/register', async (req, res) => {
             address: address || '',
             status: 'active',
             systemPrompt: defaultSystemPrompt,
-            script: defaultFirstMessage
+            script: defaultFirstMessage,
+            humanTransferCondition: HUMAN_TRANSFER_TOOL_CONDITION,
         });
 
         // 2b. Generate Knowledge Base for the school (if any qaPairs exist)
@@ -382,7 +384,8 @@ router.post('/google/callback', async (req, res) => {
                 address: address || '',
                 status: 'active',
                 systemPrompt: defaultSystemPrompt,
-                script: defaultFirstMessage
+                script: defaultFirstMessage,
+                humanTransferCondition: HUMAN_TRANSFER_TOOL_CONDITION,
             });
 
             // Generate Knowledge Base
@@ -492,7 +495,8 @@ router.post('/google/complete-signup', async (req, res) => {
             address: address || '',
             status: 'active',
             systemPrompt: defaultSystemPrompt,
-            script: defaultFirstMessage
+            script: defaultFirstMessage,
+            humanTransferCondition: HUMAN_TRANSFER_TOOL_CONDITION,
         });
 
         // Generate Knowledge Base

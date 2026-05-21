@@ -21,6 +21,7 @@ const {
     deletePhoneNumber,
     updatePhoneNumber,
     patchAgentPromptContent,
+    HUMAN_TRANSFER_TOOL_CONDITION,
 } = require('../utils/elevenlabs');
 const { aiNumberAssignmentPatch, normalizeAiDigits } = require('../utils/aiNumberOwnership');
 
@@ -422,6 +423,7 @@ router.post('/schools', async (req, res) => {
             routingNumber: routingNumber || '',
             elevenlabsAgentId: elevenlabsAgentId || '',
             status: 'active',
+            humanTransferCondition: HUMAN_TRANSFER_TOOL_CONDITION,
         });
         if (normalizeAiDigits(school.aiNumber)) {
             school.aiNumberAssignedAt = new Date();

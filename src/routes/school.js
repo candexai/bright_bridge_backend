@@ -1741,8 +1741,8 @@ router.put('/settings', async (req, res) => {
         if (tourReminderSmsTemplate !== undefined) school.tourReminderSmsTemplate = tourReminderSmsTemplate;
 
         // Validate using the latest values (after applying request body fields).
-        if (school.enableHumanTransfer && (!school.humanTransferCondition || !school.humanTransferPhoneNumber)) {
-            return res.status(400).json({ error: 'Condition and phone number are required when Human Transfer is enabled.' });
+        if (school.enableHumanTransfer && !school.humanTransferPhoneNumber) {
+            return res.status(400).json({ error: 'Transfer phone number is required when Human Transfer is enabled.' });
         }
 
         // If human transfer fields are present in payload, always sync to ElevenLabs to avoid UI/API drift.
