@@ -9,6 +9,10 @@ const {
     recordTransaction,
 } = require('../services/billingService');
 const { getPlanDef } = require('../config/billingPlans');
+const {
+    completeCouponRedemption,
+    parseCouponMetaFromCustomId,
+} = require('../services/couponService');
 
 const router = express.Router();
 
@@ -181,6 +185,7 @@ router.post('/', async (req, res) => {
             const captureId = resource.id;
             const amount = parseFloat(resource.amount?.value || '0', 10);
             const currency = resource.amount?.currency_code || 'USD';
+            const couponMeta = parseCouponMetaFromCustomId(customId);
 
             if (!schoolId) {
                 await recordTransaction({
@@ -235,10 +240,27 @@ router.post('/', async (req, res) => {
                     status: 'completed',
                     paypalEventId: eventId,
                     paypalSaleId: captureId,
-                    description: `Top-up ${minutes} minutes`,
+                    description: couponMeta.couponCode
+                        ? `Top-up ${minutes} minutes (coupon ${couponMeta.couponCode} -$${couponMeta.discountUsd.toFixed(2)})`
+                        : `Top-up ${minutes} minutes`,
                     rawEventType: eventType,
                 });
+                if (couponMeta.couponCode && couponMeta.discountUsd > 0) {
+                    await completeCouponRedemption({
+                        schoolId: school._id,
+                        couponCode: couponMeta.couponCode,
+                        orderType: 'topup',
+                        planKey: school.subscriptionPlanKey || '',
+                        paypalCaptureId: captureId,
+                        originalAmountUsd: amount + couponMeta.discountUsd,
+                        discountAmountUsd: couponMeta.discountUsd,
+                        finalAmountUsd: amount,
+                        meta: { eventId },
+                    });
+                }
             } else if (customId.includes('type:onboarding')) {
+                const planMatch = customId.match(/plan:([^;]+)/);
+                const planKey = planMatch ? planMatch[1] : '';
                 school.onboardingFeePaid = true;
                 await school.save();
                 await recordTransaction({
@@ -249,9 +271,24 @@ router.post('/', async (req, res) => {
                     status: 'completed',
                     paypalEventId: eventId,
                     paypalSaleId: captureId,
-                    description: 'Onboarding fee',
+                    description: couponMeta.couponCode
+                        ? `Onboarding fee (coupon ${couponMeta.couponCode} -$${couponMeta.discountUsd.toFixed(2)})`
+                        : 'Onboarding fee',
                     rawEventType: eventType,
                 });
+                if (couponMeta.couponCode && couponMeta.discountUsd > 0) {
+                    await completeCouponRedemption({
+                        schoolId: school._id,
+                        couponCode: couponMeta.couponCode,
+                        orderType: 'onboarding',
+                        planKey,
+                        paypalCaptureId: captureId,
+                        originalAmountUsd: amount + couponMeta.discountUsd,
+                        discountAmountUsd: couponMeta.discountUsd,
+                        finalAmountUsd: amount,
+                        meta: { eventId },
+                    });
+                }
             } else {
                 await recordTransaction({
                     schoolId: school._id,

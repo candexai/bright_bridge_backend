@@ -15,6 +15,8 @@ const ElevenLabsWebhook = require('../models/ElevenLabsWebhook');
 const AiNumberRequest = require('../models/AiNumberRequest');
 const BillingTransaction = require('../models/BillingTransaction');
 const MinuteLedger = require('../models/MinuteLedger');
+const Coupon = require('../models/Coupon');
+const CouponRedemption = require('../models/CouponRedemption');
 const { authMiddleware, adminOnly } = require('../middleware/auth');
 const {
     importSipTrunk,
@@ -614,6 +616,228 @@ router.get('/billing/transactions', async (req, res) => {
         });
     } catch (err) {
         console.error('Admin billing transactions error:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// GET /api/admin/coupons — list coupons with usage stats
+router.get('/coupons', async (req, res) => {
+    try {
+        const coupons = await Coupon.find().sort({ createdAt: -1 }).lean();
+        const couponIds = coupons.map((c) => c._id);
+        const usage = await CouponRedemption.aggregate([
+            { $match: { couponId: { $in: couponIds }, status: 'completed' } },
+            {
+                $group: {
+                    _id: '$couponId',
+                    totalUses: { $sum: 1 },
+                    totalDiscountUsd: { $sum: '$discountAmountUsd' },
+                },
+            },
+        ]);
+        const usageMap = usage.reduce((acc, u) => {
+            acc[u._id.toString()] = u;
+            return acc;
+        }, {});
+        res.json(
+            coupons.map((c) => ({
+                id: c._id.toString(),
+                code: c.code,
+                name: c.name || '',
+                description: c.description || '',
+                discountType: c.discountType,
+                discountValue: c.discountValue,
+                appliesTo: c.appliesTo || [],
+                planKeys: c.planKeys || [],
+                minAmountUsd: c.minAmountUsd || 0,
+                maxTotalUses: c.maxTotalUses,
+                maxUsesPerSchool: c.maxUsesPerSchool,
+                validFrom: c.validFrom,
+                validUntil: c.validUntil,
+                active: Boolean(c.active),
+                totalUses: usageMap[c._id.toString()]?.totalUses || 0,
+                totalDiscountUsd: usageMap[c._id.toString()]?.totalDiscountUsd || 0,
+                createdAt: c.createdAt,
+            }))
+        );
+    } catch (err) {
+        console.error('Admin coupons list error:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// POST /api/admin/coupons — create coupon
+router.post('/coupons', async (req, res) => {
+    try {
+        const body = req.body || {};
+        const code = String(body.code || '').trim().toUpperCase();
+        const discountType = String(body.discountType || '');
+        const discountValue = Number(body.discountValue);
+        if (!code) return res.status(400).json({ error: 'Coupon code is required' });
+        if (!['percent', 'fixed'].includes(discountType)) {
+            return res.status(400).json({ error: 'discountType must be percent or fixed' });
+        }
+        if (!Number.isFinite(discountValue) || discountValue <= 0) {
+            return res.status(400).json({ error: 'discountValue must be greater than 0' });
+        }
+        if (discountType === 'percent' && discountValue > 99.99) {
+            return res.status(400).json({ error: 'Percent discount must be <= 99.99' });
+        }
+
+        const appliesTo = Array.isArray(body.appliesTo)
+            ? body.appliesTo.filter((x) => ['topup', 'subscription'].includes(String(x)))
+            : [];
+        const coupon = await Coupon.create({
+            code,
+            name: String(body.name || '').trim(),
+            description: String(body.description || '').trim(),
+            discountType,
+            discountValue,
+            appliesTo: appliesTo.length ? appliesTo : ['topup', 'subscription'],
+            planKeys: Array.isArray(body.planKeys) ? body.planKeys : [],
+            minAmountUsd: Number(body.minAmountUsd || 0),
+            maxTotalUses:
+                body.maxTotalUses === null || body.maxTotalUses === undefined || body.maxTotalUses === ''
+                    ? null
+                    : Number(body.maxTotalUses),
+            maxUsesPerSchool:
+                body.maxUsesPerSchool === null || body.maxUsesPerSchool === undefined || body.maxUsesPerSchool === ''
+                    ? 1
+                    : Number(body.maxUsesPerSchool),
+            validFrom: body.validFrom ? new Date(body.validFrom) : null,
+            validUntil: body.validUntil ? new Date(body.validUntil) : null,
+            active: body.active !== false,
+            createdBy: req.user.id || null,
+            updatedBy: req.user.id || null,
+        });
+        res.status(201).json({ id: coupon._id.toString(), message: 'Coupon created' });
+    } catch (err) {
+        console.error('Admin create coupon error:', err);
+        if (err?.code === 11000) {
+            return res.status(409).json({ error: 'Coupon code already exists' });
+        }
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// PUT /api/admin/coupons/:id — update coupon
+router.put('/coupons/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid coupon id' });
+        const body = req.body || {};
+        const coupon = await Coupon.findById(id);
+        if (!coupon) return res.status(404).json({ error: 'Coupon not found' });
+
+        if (body.name !== undefined) coupon.name = String(body.name || '').trim();
+        if (body.description !== undefined) coupon.description = String(body.description || '').trim();
+        if (body.discountType !== undefined && ['percent', 'fixed'].includes(String(body.discountType))) {
+            coupon.discountType = String(body.discountType);
+        }
+        if (body.discountValue !== undefined && Number(body.discountValue) > 0) {
+            coupon.discountValue = Number(body.discountValue);
+        }
+        if (Array.isArray(body.appliesTo)) {
+            const appliesTo = body.appliesTo.filter((x) => ['topup', 'subscription'].includes(String(x)));
+            coupon.appliesTo = appliesTo.length ? appliesTo : coupon.appliesTo;
+        }
+        if (Array.isArray(body.planKeys)) coupon.planKeys = body.planKeys;
+        if (body.minAmountUsd !== undefined) coupon.minAmountUsd = Number(body.minAmountUsd || 0);
+        if (body.maxTotalUses !== undefined) {
+            coupon.maxTotalUses =
+                body.maxTotalUses === null || body.maxTotalUses === '' ? null : Number(body.maxTotalUses);
+        }
+        if (body.maxUsesPerSchool !== undefined) {
+            coupon.maxUsesPerSchool =
+                body.maxUsesPerSchool === null || body.maxUsesPerSchool === ''
+                    ? 1
+                    : Number(body.maxUsesPerSchool);
+        }
+        if (body.validFrom !== undefined) {
+            coupon.validFrom = body.validFrom ? new Date(body.validFrom) : null;
+        }
+        if (body.validUntil !== undefined) {
+            coupon.validUntil = body.validUntil ? new Date(body.validUntil) : null;
+        }
+        if (body.active !== undefined) coupon.active = Boolean(body.active);
+        coupon.updatedBy = req.user.id || null;
+        await coupon.save();
+        res.json({ message: 'Coupon updated' });
+    } catch (err) {
+        console.error('Admin update coupon error:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// POST /api/admin/coupons/:id/toggle — enable/disable coupon quickly
+router.post('/coupons/:id/toggle', async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid coupon id' });
+        const coupon = await Coupon.findById(id);
+        if (!coupon) return res.status(404).json({ error: 'Coupon not found' });
+        coupon.active = !coupon.active;
+        coupon.updatedBy = req.user.id || null;
+        await coupon.save();
+        res.json({ message: 'Coupon status updated', active: coupon.active });
+    } catch (err) {
+        console.error('Admin toggle coupon error:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// DELETE /api/admin/coupons/:id — delete coupon and its redemption rows
+router.delete('/coupons/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid coupon id' });
+        const coupon = await Coupon.findById(id).lean();
+        if (!coupon) return res.status(404).json({ error: 'Coupon not found' });
+        await Promise.all([
+            Coupon.deleteOne({ _id: id }),
+            CouponRedemption.deleteMany({ couponId: id }),
+        ]);
+        res.json({ message: 'Coupon deleted' });
+    } catch (err) {
+        console.error('Admin delete coupon error:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// GET /api/admin/coupons/redemptions — coupon usage ledger
+router.get('/coupons/redemptions', async (req, res) => {
+    try {
+        const limit = Math.min(parseInt(req.query.limit || '100', 10), 500);
+        const skip = Math.max(parseInt(req.query.skip || '0', 10), 0);
+        const [rows, total] = await Promise.all([
+            CouponRedemption.find({ status: 'completed' })
+                .sort({ createdAt: -1 })
+                .skip(skip)
+                .limit(limit)
+                .populate('schoolId', 'name')
+                .lean(),
+            CouponRedemption.countDocuments({ status: 'completed' }),
+        ]);
+        res.json({
+            total,
+            skip,
+            limit,
+            items: rows.map((r) => ({
+                id: r._id.toString(),
+                couponCode: r.couponCode,
+                schoolId: r.schoolId?._id?.toString() || null,
+                schoolName: r.schoolId?.name || null,
+                orderType: r.orderType,
+                originalAmountUsd: r.originalAmountUsd,
+                discountAmountUsd: r.discountAmountUsd,
+                finalAmountUsd: r.finalAmountUsd,
+                paypalOrderId: r.paypalOrderId || '',
+                paypalCaptureId: r.paypalCaptureId || '',
+                createdAt: r.createdAt,
+            })),
+        });
+    } catch (err) {
+        console.error('Admin coupon redemptions error:', err);
         res.status(500).json({ error: 'Internal server error' });
     }
 });
