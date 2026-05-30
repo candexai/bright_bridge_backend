@@ -101,6 +101,34 @@ router.get('/', async (req, res) => {
     }
 });
 
+// DELETE /api/admin/alerts/bulk — must be before /:id
+router.delete('/bulk', async (req, res) => {
+    try {
+        const { scope } = req.body || {};
+        const allowed = ['all', 'resolved', 'acknowledged'];
+        if (!allowed.includes(scope)) {
+            return res.status(400).json({ error: 'Invalid scope. Use: all, resolved, or acknowledged' });
+        }
+
+        let filter = {};
+        if (scope === 'resolved') {
+            filter = { status: 'RESOLVED' };
+        } else if (scope === 'acknowledged') {
+            filter = { status: 'ACKNOWLEDGED' };
+        }
+
+        const result = await Alert.deleteMany(filter);
+        res.json({
+            success: true,
+            scope,
+            deletedCount: result.deletedCount,
+        });
+    } catch (err) {
+        console.error('[alerts/bulk-delete]', err);
+        res.status(500).json({ error: 'Failed to delete alerts' });
+    }
+});
+
 // GET /api/admin/alerts/:id
 router.get('/:id', async (req, res) => {
     try {
