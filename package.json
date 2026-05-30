@@ -5,7 +5,10 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js"
+    "dev": "node server.js",
+    "test:alerts": "node scripts/test-alert-system.js --keep --yes",
+    "test:alerts:plan": "node scripts/test-alert-system.js --plan",
+    "test:alerts:cleanup": "node scripts/test-alert-system.js --cleanup"
   },
   "keywords": [],
   "author": "",

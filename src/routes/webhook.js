@@ -38,6 +38,15 @@ router.post('/elevenlabs', async (req, res) => {
     // Process webhook asynchronously (after sending response)
     processWebhookAsync(payload).catch(err => {
         console.error('[Webhook] Async processing error:', err);
+        const AlertService = require('../services/alertService');
+        AlertService.create({
+            type: 'WEBHOOK_ERROR',
+            severity: 'CRITICAL',
+            title: 'ElevenLabs webhook processing failed',
+            message: err.message,
+            source: 'webhook.processWebhookAsync',
+            metadata: { stack: err.stack },
+        });
     });
 });
 
@@ -61,6 +70,14 @@ async function processWebhookAsync(payload) {
 
         if (!payload || !payload.type) {
             console.warn('[Webhook] Invalid payload: missing type field');
+            const AlertService = require('../services/alertService');
+            AlertService.create({
+                type: 'WEBHOOK_ERROR',
+                severity: 'WARNING',
+                title: 'Invalid ElevenLabs webhook payload',
+                message: 'Missing type field',
+                source: 'webhook.processWebhookAsync',
+            });
             return;
         }
 
@@ -143,6 +160,16 @@ async function processWebhookAsync(payload) {
 
         if (type === 'post_call_transcription' && schoolId) {
             deductCallMinutes(savedWebhook).catch((err) => {
+                const AlertService = require('../services/alertService');
+                AlertService.create({
+                    type: 'PAYMENT_ERROR',
+                    severity: 'WARNING',
+                    schoolId: savedWebhook.schoolId,
+                    title: 'Call minute deduction failed',
+                    message: err.message,
+                    source: 'billingService.deductCallMinutes',
+                    metadata: { stack: err.stack, webhookId: String(savedWebhook._id) },
+                });
                 console.error('[Webhook] Minute deduction error:', err);
             });
         }
@@ -164,6 +191,15 @@ async function processWebhookAsync(payload) {
     } catch (err) {
         console.error('[Webhook] Error processing webhook:', err);
         console.error('[Webhook] Error stack:', err.stack);
+        const AlertService = require('../services/alertService');
+        AlertService.create({
+            type: 'WEBHOOK_ERROR',
+            severity: 'CRITICAL',
+            title: 'Webhook processing error',
+            message: err.message,
+            source: 'webhook.processWebhookAsync',
+            metadata: { stack: err.stack },
+        });
 
         // Try to save error information
         try {
@@ -231,6 +267,15 @@ async function processTranscriptWithAI(webhookId, transcriptArray) {
 
     } catch (err) {
         console.error(`[Webhook AI] Error processing transcript for webhook ${webhookId}:`, err);
+        const AlertService = require('../services/alertService');
+        AlertService.create({
+            type: 'WEBHOOK_ERROR',
+            severity: 'WARNING',
+            title: 'Webhook AI transcript processing failed',
+            message: err.message,
+            source: 'webhook.processTranscriptWithAI',
+            metadata: { stack: err.stack, webhookId: String(webhookId) },
+        });
         // Mark as AI processed even if it failed, so we don't retry indefinitely
         try {
             const existingWebhook = await ElevenLabsWebhook.findById(webhookId).select('metadata').lean();

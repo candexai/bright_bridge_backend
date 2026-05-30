@@ -17,6 +17,7 @@ const {
     DEFAULT_FIRST_MESSAGE_TEMPLATE,
     HUMAN_TRANSFER_TOOL_CONDITION,
 } = require('../utils/elevenlabs');
+const AlertService = require('../services/alertService');
 
 const router = express.Router();
 const JWT_SECRET = process.env.JWT_SECRET || 'childcare-enrollment-ai-secret-key-2024';
@@ -173,10 +174,29 @@ router.post('/register', async (req, res) => {
                         `[Register] Stored tool IDs ${school.toolIds.join(', ')} but ElevenLabs link failed for ${agentId}. `
                         + 'Restart the backend if you still see [Agent Patch Prompt] logs (old code).'
                     );
+                    AlertService.create({
+                        type: 'AGENT_ERROR',
+                        severity: 'WARNING',
+                        schoolId: school._id,
+                        schoolName,
+                        title: 'ElevenLabs tool linking failed during signup',
+                        message: `linkAgentToolIds failed for agent ${agentId}`,
+                        source: 'auth.register',
+                    });
                 }
             }
 
             await school.save();
+        } else {
+            AlertService.create({
+                type: 'AGENT_ERROR',
+                severity: 'CRITICAL',
+                schoolId: school._id,
+                schoolName,
+                title: 'School registered without voice agent',
+                message: 'createSchoolAgent returned null during registration',
+                source: 'auth.register',
+            });
         }
 
         // 3. Create the user
@@ -221,6 +241,21 @@ router.post('/register', async (req, res) => {
         });
     } catch (err) {
         console.error('Registration error:', err);
+        const dupFields = err.keyPattern ? Object.keys(err.keyPattern).join(', ') : null;
+        AlertService.create({
+            type: 'SIGNUP_ERROR',
+            severity: 'CRITICAL',
+            title: 'School registration failed',
+            message: err.message || 'Registration failed',
+            source: 'auth.register',
+            metadata: {
+                stack: err.stack,
+                mongoCode: err.code,
+                failureReason: dupFields
+                    ? `Duplicate value for: ${dupFields} (${err.keyValue ? JSON.stringify(err.keyValue) : 'see logs'})`
+                    : err.message,
+            },
+        });
         res.status(500).json({ error: 'Internal server error' });
     }
 });
@@ -414,6 +449,16 @@ router.post('/google/callback', async (req, res) => {
                 }
 
                 await school.save();
+            } else {
+                AlertService.create({
+                    type: 'AGENT_ERROR',
+                    severity: 'CRITICAL',
+                    schoolId: school._id,
+                    schoolName,
+                    title: 'Google signup without voice agent',
+                    message: 'createSchoolAgent returned null',
+                    source: 'auth.google.callback',
+                });
             }
 
             // Create user with Google OAuth
@@ -460,6 +505,14 @@ router.post('/google/callback', async (req, res) => {
         }
     } catch (err) {
         console.error('Google OAuth callback error:', err);
+        AlertService.create({
+            type: 'SIGNUP_ERROR',
+            severity: 'CRITICAL',
+            title: 'Google OAuth signup failed',
+            message: err.message,
+            source: 'auth.google.callback',
+            metadata: { stack: err.stack },
+        });
         res.status(500).json({ error: 'Internal server error' });
     }
 });
@@ -525,6 +578,16 @@ router.post('/google/complete-signup', async (req, res) => {
             }
 
             await school.save();
+        } else {
+            AlertService.create({
+                type: 'AGENT_ERROR',
+                severity: 'CRITICAL',
+                schoolId: school._id,
+                schoolName,
+                title: 'Google complete-signup without voice agent',
+                message: 'createSchoolAgent returned null',
+                source: 'auth.google.complete-signup',
+            });
         }
 
         // Create user
@@ -570,6 +633,14 @@ router.post('/google/complete-signup', async (req, res) => {
         });
     } catch (err) {
         console.error('Complete Google signup error:', err);
+        AlertService.create({
+            type: 'SIGNUP_ERROR',
+            severity: 'CRITICAL',
+            title: 'Google complete-signup failed',
+            message: err.message,
+            source: 'auth.google.complete-signup',
+            metadata: { stack: err.stack },
+        });
         res.status(500).json({ error: 'Internal server error' });
     }
 });

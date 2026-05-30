@@ -1,5 +1,28 @@
 const axios = require('axios');
 const { getComprehensivePrompt } = require('../utils/comprehensivePrompt');
+const AlertService = require('./alertService');
+
+function reportOpenAIAlert(err, context = {}) {
+    const status = err?.response?.status;
+    let severity = 'WARNING';
+    let type = 'OPENAI_ERROR';
+    if (status === 401) severity = 'CRITICAL';
+    if (status === 429) {
+        severity = 'CRITICAL';
+        type = 'RATE_LIMIT_ERROR';
+    }
+    if (err?.code === 'ECONNABORTED') severity = 'WARNING';
+    AlertService.create({
+        type,
+        severity,
+        schoolId: context.schoolId,
+        schoolName: context.schoolName,
+        title: context.title || 'OpenAI API failure',
+        message: err?.response?.data?.error?.message || err?.message || 'OpenAI request failed',
+        source: context.source || 'openaiService',
+        metadata: { status, stack: err?.stack },
+    });
+}
 
 /**
  * Format transcript array into readable text
@@ -132,6 +155,10 @@ async function processTranscriptComprehensive(transcriptArray) {
 
     } catch (err) {
         console.error('[OpenAI] Error in comprehensive processing:', err.response?.data || err.message);
+        reportOpenAIAlert(err, {
+            title: 'OpenAI transcript processing failed',
+            source: 'openaiService.processTranscriptComprehensive',
+        });
         return null;
     }
 }

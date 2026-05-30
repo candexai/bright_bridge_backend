@@ -1,5 +1,39 @@
 const axios = require('axios');
 const FormData = require('form-data');
+const AlertService = require('../services/alertService');
+
+function reportElevenLabsAlert(err, context = {}) {
+    const status = err?.response?.status;
+    const detail = err?.response?.data?.detail || err?.response?.data?.message || err?.message || 'Unknown error';
+    let severity = 'WARNING';
+    let type = 'ELEVENLABS_ERROR';
+
+    if (status === 401 || status === 403) {
+        severity = 'CRITICAL';
+    } else if (status === 429) {
+        severity = 'CRITICAL';
+        type = 'RATE_LIMIT_ERROR';
+    } else if (err?.code === 'ECONNABORTED' || /timeout/i.test(String(detail))) {
+        severity = 'WARNING';
+    } else if (status >= 500) {
+        severity = 'CRITICAL';
+    }
+
+    AlertService.create({
+        type,
+        severity,
+        schoolId: context.schoolId,
+        schoolName: context.schoolName,
+        title: context.title || 'ElevenLabs API failure',
+        message: typeof detail === 'object' ? JSON.stringify(detail) : String(detail),
+        source: context.source || 'elevenlabs',
+        metadata: {
+            status,
+            stack: err?.stack,
+            ...context.metadata,
+        },
+    });
+}
 
 const APPOINTMENT_AGENT_PROMPT = ``;
 
@@ -568,7 +602,15 @@ async function createSchoolAgent(schoolName, knowledgeBaseId = null, toolIds = [
         console.error(`[Agent Create] Error Status:`, err.response?.status);
         console.error(`[Agent Create] Error Data:`, JSON.stringify(err.response?.data || {}, null, 2));
         console.error(`[Agent Create] Error Message:`, err.message);
-        // Do not throw, we still want registration to succeed even if agent creation fails
+        AlertService.create({
+            type: 'AGENT_ERROR',
+            severity: 'CRITICAL',
+            schoolName,
+            title: `Agent creation failed: ${schoolName}`,
+            message: err.message || 'createSchoolAgent failed',
+            source: 'elevenlabs.createSchoolAgent',
+            metadata: { stack: err.stack, status: err.response?.status },
+        });
         return null;
     }
 }
@@ -1197,6 +1239,11 @@ async function syncSchoolAgent(agentId, {
     const transferResult = await patchAgentHumanTransfer(agentId, humanTransfer, { branchId });
     if (transferOn && !transferResult) {
         const err = new Error('Prompt saved but human transfer failed to sync to ElevenLabs (built_in_tools).');
+        reportElevenLabsAlert(err, {
+            title: 'ElevenLabs agent sync failed',
+            source: 'elevenlabs.syncSchoolAgent',
+            metadata: { agentId },
+        });
         err.statusCode = 502;
         throw err;
     }

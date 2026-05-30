@@ -25,6 +25,28 @@ async function createIndexes() {
       { name: 'action_needed_query_idx' }
     );
 
+    const alertsCollection = db.collection('alerts');
+    console.log('Creating alert index: { dedupeKey: 1, status: 1, lastOccurredAt: -1 }');
+    await alertsCollection.createIndex(
+      { dedupeKey: 1, status: 1, lastOccurredAt: -1 },
+      { name: 'dedupe_status_lastOccurred_idx' }
+    );
+    console.log('Creating alert index: { severity: 1, status: 1, lastOccurredAt: -1 }');
+    await alertsCollection.createIndex(
+      { severity: 1, status: 1, lastOccurredAt: -1 },
+      { name: 'severity_status_lastOccurred_idx' }
+    );
+    console.log('Creating alert index: { schoolId: 1, lastOccurredAt: -1 }');
+    await alertsCollection.createIndex(
+      { schoolId: 1, lastOccurredAt: -1 },
+      { name: 'schoolId_lastOccurred_idx' }
+    );
+    console.log('Creating alert index: { type: 1, lastOccurredAt: -1 }');
+    await alertsCollection.createIndex(
+      { type: 1, lastOccurredAt: -1 },
+      { name: 'type_lastOccurred_idx' }
+    );
+
     console.log('Indexes created successfully');
   } catch (err) {
     console.error('Error creating indexes:', err);

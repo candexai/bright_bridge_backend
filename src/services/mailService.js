@@ -4,6 +4,21 @@ const nodemailer = require('nodemailer');
 const Integration = require('../models/Integration');
 const School = require('../models/School');
 const { refreshOutlookToken } = require('./calendarService');
+const AlertService = require('./alertService');
+
+async function reportEmailFailure(schoolId, err, context = '') {
+    const school = schoolId ? await School.findById(schoolId).select('name').lean() : null;
+    AlertService.create({
+        type: 'EMAIL_ERROR',
+        severity: 'CRITICAL',
+        schoolId,
+        schoolName: school?.name,
+        title: 'Email send failed',
+        message: `${context} ${err?.message || 'All providers failed'}`.trim(),
+        source: 'mailService.sendEmail',
+        metadata: { stack: err?.stack },
+    });
+}
 
 /**
  * Creates a Google OAuth2 client for a school's integration.
@@ -57,11 +72,21 @@ async function sendEmail(schoolId, opts) {
         
         // 3. Last fallback to system SMTP if configured
         console.log(`[MailService] No suitable integration found or all failed for school ${schoolId}, falling back to SMTP.`);
-        return await sendViaSMTP(opts);
+        try {
+            return await sendViaSMTP(opts);
+        } catch (smtpErr) {
+            await reportEmailFailure(schoolId, smtpErr, 'SMTP fallback failed after provider attempts');
+            throw smtpErr;
+        }
 
     } catch (err) {
         console.error('[MailService] Unified send error:', err.message);
-        return await sendViaSMTP(opts);
+        try {
+            return await sendViaSMTP(opts);
+        } catch (smtpErr) {
+            await reportEmailFailure(schoolId, smtpErr, 'SMTP fallback failed');
+            throw smtpErr;
+        }
     }
 }
 
@@ -173,12 +198,12 @@ async function sendViaOutlook(integration, { to, subject, text, html, attachment
     return { success: true, method: 'outlook' };
 }
 
-async function sendViaSMTP({ to, subject, text, html, attachments }) {
+async function sendViaSMTP({ to, subject, text, html, attachments, from: fromOverride }) {
     const host = process.env.SMTP_HOST;
     const port = process.env.SMTP_PORT || 587;
     const user = process.env.SMTP_USER;
     const pass = process.env.SMTP_PASS || process.env.SMTP_PASSWORD;
-    const from = process.env.MAIL_FROM || process.env.EMAIL_FROM || user || 'noreply@enrollmentai.com';
+    const from = fromOverride || process.env.MAIL_FROM || process.env.EMAIL_FROM || user || 'noreply@enrollmentai.com';
 
     if (!host || !user || !pass) {
         throw new Error('SMTP not configured');
@@ -204,4 +229,4 @@ async function sendViaSMTP({ to, subject, text, html, attachments }) {
     return { success: true, method: 'smtp', messageId: info.messageId };
 }
 
-module.exports = { sendEmail };
+module.exports = { sendEmail, sendViaSMTP };

@@ -200,6 +200,16 @@ router.get('/outlook/callback', async (req, res) => {
         res.redirect(`${process.env.FRONTEND_URL || process.env.FORM_BASE_URL || 'http://localhost:5173'}/school/integrations?success=outlook`);
     } catch (err) {
         console.error('Outlook Callback Error:', err);
+        const AlertService = require('../services/alertService');
+        AlertService.create({
+            type: 'OUTLOOK_ERROR',
+            severity: 'WARNING',
+            schoolId: req.query.state,
+            title: 'Outlook OAuth connection failed',
+            message: err.message,
+            source: 'integrations.outlook.callback',
+            metadata: { stack: err.stack },
+        });
         res.redirect(`${process.env.FRONTEND_URL || process.env.FORM_BASE_URL || 'http://localhost:5173'}/school/integrations?error=outlook`);
     }
 });

@@ -16,6 +16,7 @@ const {
     parseCouponMetaFromCustomId,
     round2,
 } = require('../services/couponService');
+const AlertService = require('../services/alertService');
 
 function formatPayPalApiError(err) {
     const d = err.response?.data;
@@ -579,6 +580,16 @@ router.post('/capture-order', async (req, res) => {
             const expectedUsd = round2(computeTopupUsd(minutes) - couponMeta.discountUsd);
             if (Math.abs(amount - expectedUsd) > 0.03) {
                 console.warn('[billing/capture-order] top-up amount mismatch', { minutes, expectedUsd, amount });
+                AlertService.create({
+                    type: 'PAYMENT_ERROR',
+                    severity: 'CRITICAL',
+                    schoolId: school._id,
+                    schoolName: school.name,
+                    title: 'PayPal top-up amount mismatch',
+                    message: `Expected $${expectedUsd}, captured $${amount}`,
+                    source: 'billing.capture-order',
+                    metadata: { minutes, expectedUsd, amount, orderId },
+                });
                 return res.status(400).json({ error: 'Captured amount does not match this top-up.' });
             }
 
@@ -673,6 +684,16 @@ router.post('/capture-order', async (req, res) => {
             const expectedUsd = round2(def.monthlyUsd - couponMeta.discountUsd);
             if (Math.abs(amount - expectedUsd) > 0.03) {
                 console.warn('[billing/capture-order] subscription first payment mismatch', { expectedUsd, amount, planKey });
+                AlertService.create({
+                    type: 'PAYMENT_ERROR',
+                    severity: 'CRITICAL',
+                    schoolId: school._id,
+                    schoolName: school.name,
+                    title: 'PayPal subscription payment mismatch',
+                    message: `Expected $${expectedUsd}, captured $${amount}`,
+                    source: 'billing.capture-order',
+                    metadata: { expectedUsd, amount, planKey, orderId },
+                });
                 return res.status(400).json({ error: 'Captured amount does not match this discounted first payment.' });
             }
 

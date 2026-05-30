@@ -309,10 +309,31 @@ router.post('/refer/:code/register', async (req, res) => {
                     console.log(`[Referral Register] Tools linked to agent ${agentId}:`, school.toolIds);
                 } else {
                     console.warn(`[Referral Register] tool_ids link failed for ${agentId}; IDs saved in DB:`, school.toolIds);
+                    const AlertService = require('../services/alertService');
+                    AlertService.create({
+                        type: 'AGENT_ERROR',
+                        severity: 'WARNING',
+                        schoolId: school._id,
+                        schoolName: schoolName.trim(),
+                        title: 'Referral signup: tool linking failed',
+                        message: `linkAgentToolIds failed for agent ${agentId}`,
+                        source: 'public.refer.register',
+                    });
                 }
             }
 
             await school.save();
+        } else {
+            const AlertService = require('../services/alertService');
+            AlertService.create({
+                type: 'AGENT_ERROR',
+                severity: 'CRITICAL',
+                schoolId: school._id,
+                schoolName: schoolName.trim(),
+                title: 'Referral signup without voice agent',
+                message: 'createSchoolAgent returned null',
+                source: 'public.refer.register',
+            });
         }
 
         const passwordHash = bcrypt.hashSync(password, 10);
@@ -348,6 +369,15 @@ router.post('/refer/:code/register', async (req, res) => {
         });
     } catch (err) {
         console.error('Referral register error:', err);
+        const AlertService = require('../services/alertService');
+        AlertService.create({
+            type: 'SIGNUP_ERROR',
+            severity: 'CRITICAL',
+            title: 'Referral school registration failed',
+            message: err.message,
+            source: 'public.refer.register',
+            metadata: { stack: err.stack },
+        });
         res.status(500).json({ error: 'Internal server error' });
     }
 });

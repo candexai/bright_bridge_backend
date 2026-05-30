@@ -5,11 +5,112 @@ const School = require('./models/School');
 const User = require('./models/User');
 const Integration = require('./models/Integration');
 const ReferralLink = require('./models/ReferralLink');
+const AlertService = require('./services/alertService');
+
+let mongooseEventsRegistered = false;
+let isShuttingDown = false;
+let disconnectAlertTimer = null;
+
+/** Wait before CRITICAL email — Atlas/local blips often reconnect within seconds. */
+const DISCONNECT_ALERT_DELAY_MS = parseInt(process.env.MONGODB_DISCONNECT_ALERT_DELAY_MS || '30000', 10);
+
+function registerShutdownHandlers() {
+    const markShuttingDown = () => {
+        isShuttingDown = true;
+        if (disconnectAlertTimer) {
+            clearTimeout(disconnectAlertTimer);
+            disconnectAlertTimer = null;
+        }
+    };
+    process.once('SIGINT', markShuttingDown);
+    process.once('SIGTERM', markShuttingDown);
+    process.once('beforeExit', markShuttingDown);
+}
+
+function registerMongooseConnectionAlerts() {
+    if (mongooseEventsRegistered) return;
+    mongooseEventsRegistered = true;
+    registerShutdownHandlers();
+
+    mongoose.connection.on('disconnected', () => {
+        console.warn('[Database] MongoDB disconnected (may be transient — waiting before alert)');
+
+        if (disconnectAlertTimer) clearTimeout(disconnectAlertTimer);
+
+        if (isShuttingDown) {
+            console.log('[Database] Skip disconnect alert — server is shutting down');
+            return;
+        }
+
+        disconnectAlertTimer = setTimeout(() => {
+            disconnectAlertTimer = null;
+            if (isShuttingDown) return;
+            if (mongoose.connection.readyState === 1) {
+                console.log('[Database] Skip disconnect alert — already reconnected');
+                return;
+            }
+            console.error('[Database] MongoDB still disconnected — creating CRITICAL alert');
+            AlertService.create({
+                type: 'DATABASE_ERROR',
+                severity: 'CRITICAL',
+                title: 'MongoDB disconnected',
+                message: 'Mongoose connection has been down for more than 30 seconds. The app cannot read or write data until MongoDB is back.',
+                source: 'database.mongoose',
+                metadata: { event: 'disconnected', sustainedMs: DISCONNECT_ALERT_DELAY_MS },
+            });
+        }, DISCONNECT_ALERT_DELAY_MS);
+    });
+
+    mongoose.connection.on('reconnected', () => {
+        if (disconnectAlertTimer) {
+            clearTimeout(disconnectAlertTimer);
+            disconnectAlertTimer = null;
+            console.log('[Database] MongoDB reconnected — cancelled pending disconnect alert');
+        } else {
+            console.log('[Database] MongoDB reconnected');
+        }
+        // Recovery is logged only — no email (avoid noise after brief blips)
+        AlertService.create({
+            type: 'DATABASE_ERROR',
+            severity: 'INFO',
+            title: 'MongoDB reconnected',
+            message: 'Mongoose connection re-established after a brief interruption.',
+            source: 'database.mongoose',
+            metadata: { event: 'reconnected' },
+        });
+    });
+
+    mongoose.connection.on('error', (err) => {
+        console.error('[Database] MongoDB connection error:', err.message);
+        if (isShuttingDown) return;
+        AlertService.create({
+            type: 'DATABASE_ERROR',
+            severity: 'CRITICAL',
+            title: 'MongoDB connection error',
+            message: err.message,
+            source: 'database.mongoose',
+            metadata: { stack: err.stack, event: 'error' },
+        });
+    });
+}
 
 async function connectDatabase() {
     const uri = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/childcare-enrollment-ai';
-    await mongoose.connect(uri);
-    console.log('✅ Connected to MongoDB');
+    registerMongooseConnectionAlerts();
+    try {
+        await mongoose.connect(uri);
+        console.log('✅ Connected to MongoDB');
+    } catch (err) {
+        AlertService.create({
+            type: 'DATABASE_ERROR',
+            severity: 'CRITICAL',
+            title: 'MongoDB initial connection failed',
+            message: err.message,
+            source: 'database.connect',
+            metadata: { stack: err.stack },
+        });
+        throw err;
+    }
 }
 
 async function seedDatabase() {

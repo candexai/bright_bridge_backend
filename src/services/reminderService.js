@@ -3,6 +3,7 @@ const TourBooking = require('../models/TourBooking');
 const School = require('../models/School');
 const Followup = require('../models/Followup');
 const { sendTourConfirmation } = require('./automation');
+const AlertService = require('./alertService');
 
 /**
  * Initialize background cron jobs for reminders and follow-ups
@@ -13,8 +14,32 @@ function initReminderService() {
     // Run every hour to check for reminders and follow-ups
     cron.schedule('0 * * * *', async () => {
         console.log('[Reminder Service] Running hourly check...');
-        await sendUpcomingReminders();
-        await sendPostTourFollowups();
+        const started = Date.now();
+        try {
+            await sendUpcomingReminders();
+            await sendPostTourFollowups();
+            const elapsed = Date.now() - started;
+            if (elapsed > 5 * 60 * 1000) {
+                AlertService.create({
+                    type: 'CRON_ERROR',
+                    severity: 'WARNING',
+                    title: 'Reminder cron job ran long',
+                    message: `Hourly reminder job took ${Math.round(elapsed / 1000)}s`,
+                    source: 'reminderService.cron',
+                    metadata: { elapsedMs: elapsed },
+                });
+            }
+        } catch (err) {
+            console.error('[Reminder Service] Cron job failed:', err);
+            AlertService.create({
+                type: 'CRON_ERROR',
+                severity: 'CRITICAL',
+                title: 'Reminder cron job failed',
+                message: err.message,
+                source: 'reminderService.cron',
+                metadata: { stack: err.stack },
+            });
+        }
     });
 }
 
@@ -45,6 +70,14 @@ async function sendUpcomingReminders() {
         }
     } catch (err) {
         console.error('[Reminder Service] Error in upcoming reminders:', err);
+        AlertService.create({
+            type: 'CRON_ERROR',
+            severity: 'WARNING',
+            title: 'Upcoming tour reminders failed',
+            message: err.message,
+            source: 'reminderService.sendUpcomingReminders',
+            metadata: { stack: err.stack },
+        });
     }
 }
 
@@ -75,6 +108,14 @@ async function sendPostTourFollowups() {
         }
     } catch (err) {
         console.error('[Reminder Service] Error in post-tour follow-ups:', err);
+        AlertService.create({
+            type: 'CRON_ERROR',
+            severity: 'WARNING',
+            title: 'Post-tour follow-ups failed',
+            message: err.message,
+            source: 'reminderService.sendPostTourFollowups',
+            metadata: { stack: err.stack },
+        });
     }
 }
 

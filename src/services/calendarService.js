@@ -5,6 +5,32 @@ const mongoose = require('mongoose');
 const { pca, getMsalClient } = require('../routes/integrations');
 const Integration = require('../models/Integration');
 const TourBooking = require('../models/TourBooking');
+const School = require('../models/School');
+const AlertService = require('./alertService');
+
+async function reportOutlookAlert(integration, title, message, severity = 'CRITICAL', metadata = {}) {
+    const schoolId = integration?.schoolId;
+    let schoolName = metadata.schoolName;
+    if (schoolId && !schoolName) {
+        const school = await School.findById(schoolId).select('name').lean();
+        schoolName = school?.name;
+    }
+    const mailbox = integration?.config?.account?.username || metadata.mailbox;
+    AlertService.create({
+        type: 'OUTLOOK_ERROR',
+        severity,
+        schoolId,
+        schoolName,
+        title,
+        message,
+        source: metadata.source || 'calendarService',
+        metadata: {
+            mailbox,
+            failureReason: message,
+            ...metadata,
+        },
+    });
+}
 
 const googleConfig = {
     clientId: process.env.GOOGLE_CLIENT_ID,
@@ -168,7 +194,25 @@ async function getOutlookBusySlots(integration, start, end) {
         return { busySlots };
     } catch (err) {
         const msg = err.response?.data?.error?.message || err.message;
+        const status = err.response?.status;
         console.error('[Calendar] Outlook busy slots error:', msg);
+        if (status === 401 || status === 403) {
+            await reportOutlookAlert(
+                integration,
+                'Outlook mailbox access denied',
+                msg,
+                'CRITICAL',
+                { source: 'calendarService.getOutlookBusySlots' }
+            );
+        } else {
+            await reportOutlookAlert(
+                integration,
+                'Outlook calendar sync failed',
+                msg,
+                'WARNING',
+                { source: 'calendarService.getOutlookBusySlots' }
+            );
+        }
         return { busySlots: [], error: msg };
     }
 }
@@ -486,7 +530,15 @@ async function createOutlookCalendarEvent(integration, { title, start, end, desc
         return { success: true, eventId, provider: 'outlook', email: integration.config?.account?.username };
     } catch (err) {
         const msg = err.response?.data?.error?.message || err.message;
+        const status = err.response?.status;
         console.error('[Calendar] Outlook error:', msg);
+        await reportOutlookAlert(
+            integration,
+            'Failed to create Outlook calendar event',
+            msg || 'Failed to create Outlook event',
+            status === 401 || status === 403 ? 'CRITICAL' : 'WARNING',
+            { source: 'calendarService.createOutlookCalendarEvent' }
+        );
         return { success: false, error: msg || 'Failed to create Outlook event' };
     }
 }
@@ -548,10 +600,16 @@ async function refreshOutlookToken(integration) {
 
         if (allAccounts.length === 0) {
             console.warn(`[Calendar] No accounts found in MSAL cache for school ${schoolId}. This usually means config.msalCache is missing or invalid.`);
-            // Mark as disconnected - requires manual re-auth
             await Integration.updateOne(
                 { _id: integration._id },
                 { $set: { connected: false } }
+            );
+            await reportOutlookAlert(
+                integration,
+                'Outlook token expired — reconnection required',
+                'No accounts found in MSAL cache',
+                'CRITICAL',
+                { source: 'calendarService.refreshOutlookToken' }
             );
             return null;
         }
@@ -652,6 +710,13 @@ async function refreshOutlookToken(integration) {
                 { _id: integration._id },
                 { $set: { connected: false, 'config.lastError': errorMessage } }
             );
+            await reportOutlookAlert(
+                integration,
+                'Outlook refresh token failed',
+                errorMessage,
+                'CRITICAL',
+                { source: 'calendarService.refreshOutlookToken', stack: error.stack }
+            );
             return null;
         }
 
@@ -660,6 +725,13 @@ async function refreshOutlookToken(integration) {
             await Integration.updateOne(
                 { _id: integration._id },
                 { $set: { connected: false, 'config.lastError': errorMessage } }
+            );
+            await reportOutlookAlert(
+                integration,
+                'Outlook authorization required',
+                errorMessage,
+                'CRITICAL',
+                { source: 'calendarService.refreshOutlookToken', stack: error.stack }
             );
             return null;
         }

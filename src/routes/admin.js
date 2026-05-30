@@ -26,11 +26,15 @@ const {
     HUMAN_TRANSFER_TOOL_CONDITION,
 } = require('../utils/elevenlabs');
 const { aiNumberAssignmentPatch, normalizeAiDigits } = require('../utils/aiNumberOwnership');
+const AlertService = require('../services/alertService');
+
+const alertsRouter = require('./alerts');
 
 const router = express.Router();
 
 // Apply auth middleware to all admin routes
 router.use(authMiddleware, adminOnly);
+router.use('/alerts', alertsRouter);
 
 // GET /api/admin/dashboard - Dashboard metrics
 router.get('/dashboard', async (req, res) => {
@@ -1099,7 +1103,16 @@ router.post('/schools/:id/assign-number', async (req, res) => {
                 console.log(`[Assign Phone] ElevenLabs Reconcile Success`);
             } catch (elError) {
                 console.error(`[Assign Phone] ElevenLabs link failed:`, elError.message);
-                // We return 500 here because assignment failed at the voice provider level
+                AlertService.create({
+                    type: 'AGENT_ERROR',
+                    severity: 'CRITICAL',
+                    schoolId: school._id,
+                    schoolName: school.name,
+                    title: 'ElevenLabs phone link failed',
+                    message: elError.message,
+                    source: 'admin.assign-number',
+                    metadata: { agentId: school.elevenlabsAgentId, phoneNumberId: phoneNum.phone_number_id },
+                });
                 return res.status(500).json({ 
                     error: `ElevenLabs Linking Failed: ${elError.message}. Please check if the Agent ID is valid in ElevenLabs.` 
                 });

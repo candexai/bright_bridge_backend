@@ -13,6 +13,7 @@ const {
     completeCouponRedemption,
     parseCouponMetaFromCustomId,
 } = require('../services/couponService');
+const AlertService = require('../services/alertService');
 
 const router = express.Router();
 
@@ -38,6 +39,13 @@ router.post('/', async (req, res) => {
         const ok = await verifyWebhookSignature(buf, req.headers);
         if (!ok) {
             console.warn('[PayPal Webhook] Signature verification failed');
+            AlertService.create({
+                type: 'WEBHOOK_ERROR',
+                severity: 'CRITICAL',
+                title: 'PayPal webhook signature verification failed',
+                message: 'Invalid webhook signature',
+                source: 'paypalWebhook.verify',
+            });
             return res.status(401).send('Invalid signature');
         }
 

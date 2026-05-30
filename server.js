@@ -44,9 +44,23 @@ app.use('/api/v1/webhook', webhookRoutes);
 app.use('/api/billing', billingRoutes);
 
 // Health check
-app.get('/api/health', (req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+const { runHealthChecks } = require('./src/services/healthService');
+app.get('/api/health', async (req, res) => {
+    try {
+        const result = await runHealthChecks();
+        const httpStatus = result.status === 'down' ? 503 : 200;
+        res.status(httpStatus).json(result);
+    } catch (err) {
+        res.status(503).json({
+            status: 'down',
+            timestamp: new Date().toISOString(),
+            error: err.message,
+        });
+    }
 });
+
+const { errorHandler } = require('./src/middleware/errorHandler');
+app.use(errorHandler);
 
 // Connect to MongoDB and start server
 async function start() {

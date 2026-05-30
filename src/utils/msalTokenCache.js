@@ -1,4 +1,5 @@
 const Integration = require('../models/Integration');
+const AlertService = require('../services/alertService');
 
 /**
  * MSAL Token Cache Plugin for MongoDB persistence.
@@ -30,6 +31,15 @@ function createMsalCachePlugin(schoolId) {
                     console.log(`[MSAL Cache] Cache updated and persisted for school ${schoolId} (new length: ${msalCache.length})`);
                 } catch (err) {
                     console.error(`[MSAL Cache] Error writing cache for school ${schoolId}:`, err.message);
+                    AlertService.create({
+                        type: 'OUTLOOK_ERROR',
+                        severity: 'WARNING',
+                        schoolId,
+                        title: 'Outlook MSAL cache persist failed',
+                        message: err.message,
+                        source: 'msalTokenCache.afterCacheAccess',
+                        metadata: { stack: err.stack },
+                    });
                 }
             }
         }
