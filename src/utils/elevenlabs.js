@@ -552,6 +552,11 @@ Close politely.
 
 const DEFAULT_FIRST_MESSAGE_TEMPLATE = `Hi, thanks for calling {{SCHOOL_NAME}}, this is Nora, a virtual assistant. If you are a current enrolled family, just say "current family" and I will connect you. Si es una familia actual inscrita, diga "familia actual" y le conecto. For a tour or enrollment, tell me how I can help. You can speak in English or Spanish. How can I help you today?`;
 
+function getPostCallWebhookUrl() {
+    const base = (process.env.BACKEND_URL || 'https://montessori-enrollment-ai-backend-1.onrender.com').replace(/\/$/, '');
+    return `${base}/api/v1/webhook/elevenlabs`;
+}
+
 async function createSchoolAgent(schoolName, knowledgeBaseId = null, toolIds = []) {
     const baseUrl = process.env.ELEVENLABS_API_URL;
     if (!baseUrl) {
@@ -573,7 +578,7 @@ async function createSchoolAgent(schoolName, knowledgeBaseId = null, toolIds = [
             system_prompt: fullPrompt,
             knowledge_base_ids: knowledgeBaseId ? [knowledgeBaseId] : [],
             voice_id: "jqcCZkN6Knx8BJ5TBdYR",// Default voice
-            post_call_webhook_url: "https://montessori-enrollment-ai-backend.onrender.com/api/v1/webhook/elevenlabs",
+            post_call_webhook_url: getPostCallWebhookUrl(),
         };
 
         // Only set tool_ids at create when explicitly provided. Registration uses
