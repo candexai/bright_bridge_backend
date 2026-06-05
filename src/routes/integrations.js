@@ -7,6 +7,18 @@ const { createMsalCachePlugin } = require('../utils/msalTokenCache');
 
 const router = express.Router();
 
+const OUTLOOK_SCOPES = ['User.Read', 'Calendars.ReadWrite', 'Mail.Send', 'offline_access'];
+
+function integrationsPageUrl(query = {}) {
+    const base = process.env.FRONTEND_URL || process.env.FORM_BASE_URL || 'http://localhost:5173';
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries(query)) {
+        if (value != null && value !== '') params.set(key, String(value));
+    }
+    const qs = params.toString();
+    return `${base}/school/integrations${qs ? `?${qs}` : ''}`;
+}
+
 // ── Google OAuth Configuration ──
 const googleConfig = {
     clientId: process.env.GOOGLE_CLIENT_ID,
@@ -76,7 +88,7 @@ async function getOutlookAuthUrl(schoolId) {
     if (!schoolPca) return null;
 
     const authCodeUrlParameters = {
-        scopes: ['user.read', 'calendars.readwrite', 'mail.send', 'offline_access'],
+        scopes: OUTLOOK_SCOPES,
         redirectUri: process.env.OUTLOOK_REDIRECT_URI,
         state: schoolId.toString(),
         prompt: 'select_account',
@@ -157,11 +169,15 @@ router.get('/google/callback', async (req, res) => {
 router.get('/outlook/callback', async (req, res) => {
     const { code, state, error, error_description } = req.query;
     if (error) {
+        const detail = error_description || error;
         console.error('Outlook OAuth error:', error, error_description);
-        return res.redirect(`${process.env.FRONTEND_URL || process.env.FORM_BASE_URL || 'http://localhost:5173'}/school/integrations?error=outlook`);
+        return res.redirect(integrationsPageUrl({ error: 'outlook', detail }));
     }
     if (!code || !state) {
-        return res.redirect(`${process.env.FRONTEND_URL || process.env.FORM_BASE_URL || 'http://localhost:5173'}/school/integrations?error=outlook`);
+        return res.redirect(integrationsPageUrl({
+            error: 'outlook',
+            detail: 'Missing authorization code or state from Microsoft',
+        }));
     }
 
     try {
@@ -169,11 +185,17 @@ router.get('/outlook/callback', async (req, res) => {
         const schoolPca = getMsalClient(schoolId);
         if (!schoolPca) throw new Error('MSAL not configured');
 
-        // Bug 1 Fix: Define tokenRequest before calling acquireTokenByCode
+        // Ensure a row exists so the MSAL cache plugin can persist refresh tokens during token exchange.
+        await Integration.findOneAndUpdate(
+            { schoolId, type: 'outlook' },
+            { $setOnInsert: { name: 'Microsoft Outlook', connected: false, config: {} } },
+            { upsert: true }
+        );
+
         const tokenRequest = {
             code,
             redirectUri: process.env.OUTLOOK_REDIRECT_URI,
-            scopes: ['user.read', 'calendars.readwrite', 'mail.send', 'offline_access'],
+            scopes: OUTLOOK_SCOPES,
         };
         const response = await schoolPca.acquireTokenByCode(tokenRequest);
 
@@ -193,11 +215,9 @@ router.get('/outlook/callback', async (req, res) => {
             { upsert: true }
         );
 
-        // Success — the cache plugin (afterCacheAccess) already saved the MSAL cache (refresh token)
-        // during the acquireTokenByCode call. Using $set above preserved it.
         console.log(`[Integrations] Outlook connected and config persisted for school: ${schoolId}`);
 
-        res.redirect(`${process.env.FRONTEND_URL || process.env.FORM_BASE_URL || 'http://localhost:5173'}/school/integrations?success=outlook`);
+        res.redirect(integrationsPageUrl({ success: 'outlook' }));
     } catch (err) {
         console.error('Outlook Callback Error:', err);
         const AlertService = require('../services/alertService');
@@ -210,7 +230,7 @@ router.get('/outlook/callback', async (req, res) => {
             source: 'integrations.outlook.callback',
             metadata: { stack: err.stack },
         });
-        res.redirect(`${process.env.FRONTEND_URL || process.env.FORM_BASE_URL || 'http://localhost:5173'}/school/integrations?error=outlook`);
+        res.redirect(integrationsPageUrl({ error: 'outlook', detail: err.message }));
     }
 });
 

@@ -1,5 +1,36 @@
 const Integration = require('../models/Integration');
-const AlertService = require('../services/alertService');
+
+function normalizeMsalCache(raw) {
+    if (raw == null) return null;
+    if (typeof raw === 'string') return raw;
+    if (typeof raw === 'object') {
+        try {
+            return JSON.stringify(raw);
+        } catch {
+            return null;
+        }
+    }
+    return null;
+}
+
+function logOutlookCacheAlert(schoolId, title, message, metadata = {}) {
+    try {
+        const AlertService = require('../services/alertService');
+        if (typeof AlertService?.create === 'function') {
+            AlertService.create({
+                type: 'OUTLOOK_ERROR',
+                severity: 'WARNING',
+                schoolId,
+                title,
+                message,
+                source: 'msalTokenCache',
+                metadata,
+            });
+        }
+    } catch (alertErr) {
+        console.error('[MSAL Cache] Failed to create alert:', alertErr.message);
+    }
+}
 
 /**
  * MSAL Token Cache Plugin for MongoDB persistence.
@@ -10,40 +41,45 @@ function createMsalCachePlugin(schoolId) {
         beforeCacheAccess: async (cacheContext) => {
             try {
                 const integration = await Integration.findOne({ schoolId, type: 'outlook' }).lean();
-                if (integration?.config?.msalCache) {
-                    cacheContext.tokenCache.deserialize(integration.config.msalCache);
-                    console.log(`[MSAL Cache] Successfully loaded cache for school ${schoolId} (length: ${integration.config.msalCache.length})`);
-                } else {
-                    console.warn(`[MSAL Cache] No cache found for school ${schoolId}`);
+                const msalCache = normalizeMsalCache(integration?.config?.msalCache);
+                if (msalCache) {
+                    cacheContext.tokenCache.deserialize(msalCache);
+                    console.log(`[MSAL Cache] Loaded cache for school ${schoolId} (length: ${msalCache.length})`);
+                } else if (integration?.config?.msalCache) {
+                    console.warn(`[MSAL Cache] Ignoring invalid cache for school ${schoolId}; starting fresh`);
+                    await Integration.updateOne(
+                        { schoolId, type: 'outlook' },
+                        { $unset: { 'config.msalCache': '' } }
+                    );
                 }
             } catch (err) {
                 console.error(`[MSAL Cache] Error reading cache for school ${schoolId}:`, err.message);
             }
         },
         afterCacheAccess: async (cacheContext) => {
-            if (cacheContext.cacheHasChanged) {
-                try {
-                    const msalCache = cacheContext.tokenCache.serialize();
-                    await Integration.updateOne(
-                        { schoolId, type: 'outlook' },
-                        { $set: { 'config.msalCache': msalCache } }
-                    );
-                    console.log(`[MSAL Cache] Cache updated and persisted for school ${schoolId} (new length: ${msalCache.length})`);
-                } catch (err) {
-                    console.error(`[MSAL Cache] Error writing cache for school ${schoolId}:`, err.message);
-                    AlertService.create({
-                        type: 'OUTLOOK_ERROR',
-                        severity: 'WARNING',
-                        schoolId,
-                        title: 'Outlook MSAL cache persist failed',
-                        message: err.message,
-                        source: 'msalTokenCache.afterCacheAccess',
-                        metadata: { stack: err.stack },
-                    });
+            if (!cacheContext.cacheHasChanged) return;
+
+            try {
+                const msalCache = cacheContext.tokenCache.serialize();
+                if (typeof msalCache !== 'string') {
+                    throw new Error('MSAL serialize did not return a string');
                 }
+                await Integration.updateOne(
+                    { schoolId, type: 'outlook' },
+                    { $set: { 'config.msalCache': msalCache } }
+                );
+                console.log(`[MSAL Cache] Cache persisted for school ${schoolId} (length: ${msalCache.length})`);
+            } catch (err) {
+                console.error(`[MSAL Cache] Error writing cache for school ${schoolId}:`, err.message);
+                logOutlookCacheAlert(
+                    schoolId,
+                    'Outlook MSAL cache persist failed',
+                    err.message,
+                    { stack: err.stack }
+                );
             }
-        }
+        },
     };
 }
 
-module.exports = { createMsalCachePlugin };
+module.exports = { createMsalCachePlugin, normalizeMsalCache };
