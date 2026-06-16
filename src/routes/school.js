@@ -18,7 +18,14 @@ const voiceAISchema = require('../models/VoiceAI');
 const AiNumberRequest = require('../models/AiNumberRequest');
 const { authMiddleware, schoolOnly } = require('../middleware/auth');
 const { getGoogleAuthUrl, getOutlookAuthUrl } = require('./integrations');
-const { getCallDurationSeconds } = require('../utils/webhookHelpers');
+const { getCallDurationSeconds, getCallerPhoneFromWebhook } = require('../utils/webhookHelpers');
+const {
+    resolveInsightsForWebhooks,
+    buildActionNeededCall,
+    loadActionNeededCalls,
+    markLeadInsightActionTaken,
+    removeLeadInsightForWebhook,
+} = require('../services/leadInsightService');
 const {
     formatQAPairsForKB,
     ingestKnowledgeBaseDocument,
@@ -28,7 +35,6 @@ const {
 const { getPlanDef } = require('../config/billingPlans');
 const {
     generateWordCloud,
-    extractTourDetails,
     mergeParentQuestionsFromExtraction,
     mergeQuestionLists
 } = require('../utils/openai');
@@ -41,24 +47,8 @@ const router = express.Router();
 // Apply auth middleware to all school routes
 router.use(authMiddleware, schoolOnly);
 
-function hasStableTagCache(webhookDoc) {
-    return Boolean(
-        webhookDoc
-        && (webhookDoc.ai_processed || webhookDoc.aiProcessed)
-        && Array.isArray(webhookDoc.extractedTags)
-        && webhookDoc.extractedTags.length > 0
-    );
-}
-
-function buildCachedComprehensiveData(webhookDoc) {
-    return {
-        tags: webhookDoc.extractedTags || [],
-        childName: webhookDoc.extractedChildName || webhookDoc.tour_booking_extracted?.childName || '',
-        childAge: webhookDoc.extractedChildAge || webhookDoc.tour_booking_extracted?.childAge || '',
-        language: webhookDoc.extractedLanguage || '',
-        missingDetails: webhookDoc.extractedMissingDetails || []
-    };
-}
+/** Exclude large blobs — transcripts alone can be 8MB+ for 265 calls. */
+const WEBHOOK_LIST_PROJECTION = '-raw_payload -audio_base64 -transcript';
 
 // Helper function to format Q&A pairs is now imported from elevenlabs utility
 
@@ -381,11 +371,8 @@ router.get('/dashboard', async (req, res) => {
             return {
                 id: wh._id.toString(),
                 conversationId: wh.conversation_id,
-                callerPhone: wh.metadata?.phone_call?.from_number
-                    || wh.tour_booking_extracted?.phone
-                    || wh.user_id
-                    || 'Web Widget',
-                callerName: resolveName(wh.metadata?.phone_call?.from_number || wh.tour_booking_extracted?.phone || '', wh.tour_booking_extracted?.name || 'Parent'),
+                callerPhone: getCallerPhoneFromWebhook(wh, 'Web Widget'),
+                callerName: resolveName(getCallerPhoneFromWebhook(wh, ''), wh.tour_booking_extracted?.name || 'Parent'),
                 duration: getCallDurationSeconds(wh),
                 timestamp: callTimestamp,
                 recordingUrl: `${backendUrl}/api/school/calls/${wh.conversation_id}/audio?token=${userToken}`,
@@ -640,123 +627,30 @@ router.get('/daily-insights', async (req, res) => {
         todayStart.setHours(0, 0, 0, 0);
         const todayEnd = new Date();
         todayEnd.setHours(23, 59, 59, 999);
+        const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+        const startedAt = Date.now();
 
-        // Build "Common Parent Questions" from a broader window so it’s actually useful.
-        // 30 days tends to be stable enough to surface repeated topics like Fees/Cameras/After-school.
-        const wordCloudStart = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+        const [actionNeeded, todaysTourDocs, todayCallsMeta] = await Promise.all([
+            loadActionNeededCalls(schoolObjectId, backendUrl, userToken, { since: thirtyDaysAgo }),
+            TourBooking.find({
+                schoolId,
+                scheduledAt: { $gte: todayStart, $lte: todayEnd },
+            }).sort({ scheduledAt: 1 }).lean(),
+            ElevenLabsWebhook.find({
+                type: 'post_call_transcription',
+                received_at: { $gte: todayStart, $lte: todayEnd },
+                schoolId: schoolObjectId,
+            }).select('_id metadata received_at').sort({ received_at: -1 }).lean(),
+        ]);
 
-        // ── 1. Needs Attention: calls from today with no tour booked ──
-        const todayWebhooks = await ElevenLabsWebhook.find({
-            type: 'post_call_transcription',
-            received_at: { $gte: todayStart, $lte: todayEnd },
-            schoolId: schoolObjectId
-        }).sort({ received_at: -1 }).lean();
-
-        // Use cached word cloud from School model
         const wordCloud = school?.wordCloud || [];
 
-        // Extract comprehensive data from transcripts using single prompt for needs-attention calls
-        const needsAttention = await Promise.all(
-            todayWebhooks
-                .filter(wh => !wh.tour_booking_detected && !wh.actionTaken)
-                .map(async (wh) => {
-                    const transcriptText = Array.isArray(wh.transcript) 
-                        ? wh.transcript.map(t => `${t.role}: ${t.message || t.text}`).join('\n')
-                        : '';
+        const needsAttention = actionNeeded.filter((call) => {
+            const ts = new Date(call.timestamp).getTime();
+            return ts >= todayStart.getTime() && ts <= todayEnd.getTime();
+        });
 
-                    let comprehensiveData = { tags: [], childName: '', childAge: '', language: '', missingDetails: [] };
-
-                    // Use stable cached comprehensive data if available, otherwise extract once and persist.
-                    if (hasStableTagCache(wh)) {
-                        comprehensiveData = buildCachedComprehensiveData(wh);
-                    } else if (transcriptText) {
-                        try {
-                            comprehensiveData = await extractTourDetails(transcriptText, {
-                                childName: wh.tour_booking_extracted?.childName || '',
-                                childAge: wh.tour_booking_extracted?.childAge || '',
-                                purpose: wh.summary || ''
-                            });
-                            
-                            // Post-processing: Remove "No child info captured" tag if child info is present
-                            if (comprehensiveData.childName && comprehensiveData.childAge) {
-                                comprehensiveData.tags = comprehensiveData.tags.filter(tag => 
-                                    !tag.toLowerCase().includes('no child info')
-                                );
-                            }
-                            
-                            // Post-processing: Ensure "No child info captured" tag is applied if child info is missing
-                            if ((!comprehensiveData.childName || !comprehensiveData.childAge) && 
-                                (comprehensiveData.missingDetails && 
-                                 (comprehensiveData.missingDetails.some(m => m.toLowerCase().includes('child name')) || 
-                                  comprehensiveData.missingDetails.some(m => m.toLowerCase().includes('child age'))))) {
-                                if (!comprehensiveData.tags.some(tag => tag.toLowerCase().includes('no child info'))) {
-                                    comprehensiveData.tags.push('No child info captured');
-                                }
-                            }
-                            
-                            // Post-processing: Ensure "Partial call" tag is applied if missing_details has any field
-                            if (comprehensiveData.missingDetails && comprehensiveData.missingDetails.length > 0) {
-                                if (!comprehensiveData.tags.some(tag => tag.toLowerCase().includes('partial call'))) {
-                                    comprehensiveData.tags.push('Partial call');
-                                }
-                            }
-                            
-                            // Cache the extracted data to the webhook document
-                            await ElevenLabsWebhook.findByIdAndUpdate(wh._id, {
-                                ai_processed: true,
-                                extractedTags: comprehensiveData.tags,
-                                extractedChildName: comprehensiveData.childName,
-                                extractedChildAge: comprehensiveData.childAge,
-                                extractedLanguage: comprehensiveData.language,
-                                extractedMissingDetails: comprehensiveData.missingDetails
-                            }).catch(err => console.error('[DAILY-INSIGHTS] Failed to cache comprehensive data:', err));
-                        } catch (err) {
-                            console.error('[DAILY-INSIGHTS] Failed to extract comprehensive data:', err);
-                        }
-                    } else if (wh.ai_processed || wh.aiProcessed) {
-                        comprehensiveData = buildCachedComprehensiveData(wh);
-                    }
-
-                    return {
-                        id: wh._id.toString(),
-                        conversationId: wh.conversation_id,
-                        callerName: wh.tour_booking_extracted?.name || 'Parent',
-                        callerPhone: wh.metadata?.phone_call?.from_number || wh.tour_booking_extracted?.phone || 'Unknown',
-                        summary: wh.summary || '',
-                        timestamp: wh.metadata?.start_time_unix_secs
-                            ? new Date(wh.metadata.start_time_unix_secs * 1000)
-                            : wh.received_at,
-                        recordingUrl: wh.conversation_id
-                            ? `${backendUrl}/api/school/calls/${wh.conversation_id}/audio?token=${userToken}`
-                            : null,
-                        duration: getCallDurationSeconds(wh),
-                        questionsAsked: mergeQuestionLists(
-                            comprehensiveData.questionsAsked,
-                            mergeParentQuestionsFromExtraction(wh.comprehensive_result, {
-                                summaryText: wh.summary || ''
-                            })
-                        ),
-                        actionTaken: wh.actionTaken || false,
-                        actionTakenAt: wh.actionTakenAt || null,
-                        actionTakenFeedback: wh.actionTakenFeedback || '',
-                        feedbackHistory: wh.feedbackHistory || undefined,
-                        tags: comprehensiveData.tags,
-                        childName: comprehensiveData.childName,
-                        childAge: comprehensiveData.childAge,
-                        language: comprehensiveData.language,
-                        missingDetails: comprehensiveData.missingDetails
-                    };
-                })
-        );
-
-        // ── 2. Today's Tours: full detail with questions from transcript ──
-        const todaysTourDocs = await TourBooking.find({
-            schoolId,
-            scheduledAt: { $gte: todayStart, $lte: todayEnd }
-        }).sort({ scheduledAt: 1 }).lean();
-
-        // Separate tours that need processing from those already cached
-        const toursToProcess = [];
+        // ── 2. Today's Tours: use cached tour + linked webhook data only (no OpenAI on page load) ──
         const enrichedToursMap = new Map();
 
         // First, add tours with usable cached AI insights to the map.
@@ -793,20 +687,22 @@ router.get('/daily-insights', async (req, res) => {
         });
         const tourPhones = unprocessedTours.map(tour => normalizePhone(tour.phone)).filter(p => p);
 
-        // Fetch recent school webhooks once; some providers omit phone metadata.
-        const lookbackStart = new Date(todayStart);
-        lookbackStart.setDate(lookbackStart.getDate() - 30);
-        const allRelevantWebhooks = await ElevenLabsWebhook.find({
-            type: 'post_call_transcription',
-            schoolId: schoolObjectId,
-            received_at: { $gte: lookbackStart }
-        }).sort({ received_at: -1 }).limit(500).lean();
+        let allRelevantWebhooks = [];
+        if (unprocessedTours.length > 0) {
+            const lookbackStart = new Date(todayStart);
+            lookbackStart.setDate(lookbackStart.getDate() - 30);
+            allRelevantWebhooks = await ElevenLabsWebhook.find({
+                type: 'post_call_transcription',
+                schoolId: schoolObjectId,
+                received_at: { $gte: lookbackStart }
+            }).select(WEBHOOK_LIST_PROJECTION).sort({ received_at: -1 }).limit(500).lean();
+        }
 
         // Create a phone-to-webhook map for efficient lookup
         const phoneToWebhookMap = new Map();
         allRelevantWebhooks.forEach(wh => {
-            const fromPhone = normalizePhone(wh.metadata?.phone_call?.from_number || '');
-            const toPhone = normalizePhone(wh.metadata?.phone_call?.to_number || '');
+            const fromPhone = normalizePhone(getCallerPhoneFromWebhook(wh, ''));
+            const toPhone = normalizePhone(wh.metadata?.phone_call?.to_number || wh.metadata?.phone_call?.agent_number || '');
             if (fromPhone && !phoneToWebhookMap.has(fromPhone)) {
                 phoneToWebhookMap.set(fromPhone, wh);
             }
@@ -834,8 +730,8 @@ router.get('/daily-insights', async (req, res) => {
                 linkedWebhook = phoneToWebhookMap.get(tourPhone) || null;
                 if (!linkedWebhook) {
                     linkedWebhook = allRelevantWebhooks.find(wh => {
-                        const fromPhone = normalizePhone(wh.metadata?.phone_call?.from_number || '');
-                        const toPhone = normalizePhone(wh.metadata?.phone_call?.to_number || '');
+                        const fromPhone = normalizePhone(getCallerPhoneFromWebhook(wh, ''));
+                        const toPhone = normalizePhone(wh.metadata?.phone_call?.to_number || wh.metadata?.phone_call?.agent_number || '');
                         return (
                             (fromPhone && fromPhone.includes(tourPhone)) ||
                             (tourPhone.includes(fromPhone) && !!fromPhone) ||
@@ -891,7 +787,7 @@ router.get('/daily-insights', async (req, res) => {
 
         const usedWebhookIds = new Set();
 
-        // Process unprocessed tours using the pre-fetched webhooks
+        // Do not run OpenAI during page load — use cached tour fields and linked webhook summaries only.
         unprocessedTours.forEach(tour => {
             const linkedWebhook = linkWebhookToTour(tour, usedWebhookIds);
 
@@ -899,74 +795,13 @@ router.get('/daily-insights', async (req, res) => {
                 usedWebhookIds.add(String(linkedWebhook._id));
             }
 
-            if (linkedWebhook) {
-                const transcriptText = Array.isArray(linkedWebhook.transcript)
-                    ? linkedWebhook.transcript.map(t => `${t.role}: ${t.message || t.text}`).join('\n')
-                    : '';
-
-                if (transcriptText) {
-                    toursToProcess.push({
-                        id: tour._id.toString(),
-                        transcript: transcriptText,
-                        existingDetails: {
-                            childName: tour.childName,
-                            childAge: tour.childAge,
-                            purpose: tour.reason
-                        },
-                        tourDoc: tour,
-                        linkedWebhook
-                    });
-                } else {
-                    // No transcript but webhook exists
-                    enrichedToursMap.set(tour._id.toString(), { ...tour, id: tour._id.toString(), linkedWebhook });
-                }
-            } else {
-                // No webhook found
-                enrichedToursMap.set(tour._id.toString(), { ...tour, id: tour._id.toString() });
-            }
+            enrichedToursMap.set(tour._id.toString(), {
+                ...tour,
+                id: tour._id.toString(),
+                linkedWebhook: linkedWebhook || null,
+                callSummary: linkedWebhook?.summary || tour.highlights || '',
+            });
         });
-
-        // Batch process the ones that need it (limit to 5 to prevent slow loading)
-        if (toursToProcess.length > 0) {
-            console.log(`[DAILY-INSIGHTS] Batch processing ${toursToProcess.length} tours (limiting to 5)...`);
-            const { batchExtractTourDetails } = require('../utils/openai');
-            const toursToProcessNow = toursToProcess.slice(0, 5); // Process max 5 at a time
-            const batchResults = await batchExtractTourDetails(toursToProcessNow);
-
-            for (const item of toursToProcessNow) {
-                const extracted = batchResults[item.id] || {};
-                const safeStr = (v) => (v && typeof v === 'object' ? JSON.stringify(v) : String(v || ''));
-                
-                const aiDetails = {
-                    childName: safeStr(extracted.childName || item.tourDoc.childName || ''),
-                    childAge: safeStr(extracted.childAge || item.tourDoc.childAge || ''),
-                    purpose: safeStr(extracted.purpose || item.tourDoc.reason || 'Enrollment Inquiry'),
-                    questionsAsked: Array.isArray(extracted.questionsAsked) ? extracted.questionsAsked.map(q => safeStr(q)) : [],
-                    notes: safeStr(extracted.notes || item.linkedWebhook.summary || '')
-                };
-
-                // Cache to DB (no await needed for each, can do bulk or background)
-                TourBooking.findByIdAndUpdate(item.id, {
-                    childName: aiDetails.childName,
-                    childAge: aiDetails.childAge,
-                    reason: aiDetails.purpose,
-                    questionsAsked: aiDetails.questionsAsked,
-                    highlights: aiDetails.notes,
-                    aiProcessed: true
-                }).catch(err => console.error(`[DAILY-INSIGHTS] Failed to cache tour ${item.id}:`, err));
-
-                enrichedToursMap.set(item.id, {
-                    ...item.tourDoc,
-                    id: item.id,
-                    childName: aiDetails.childName,
-                    childAge: aiDetails.childAge,
-                    reason: aiDetails.purpose,
-                    questionsAsked: aiDetails.questionsAsked,
-                    highlights: aiDetails.notes,
-                    callSummary: item.linkedWebhook.summary || ''
-                });
-            }
-        }
 
         const todaysTours = todaysTourDocs.map(tour => {
             const enriched = enrichedToursMap.get(tour._id.toString()) || { ...tour, id: tour._id.toString() };
@@ -996,14 +831,24 @@ router.get('/daily-insights', async (req, res) => {
             };
         });
 
-        const todayCalls = todayWebhooks.map(wh => ({
+        const todayCalls = todayCallsMeta.map(wh => ({
             id: wh._id.toString(),
             timestamp: wh.metadata?.start_time_unix_secs
                 ? new Date(wh.metadata.start_time_unix_secs * 1000)
                 : wh.received_at,
         }));
 
-        res.json({ needsAttention, todaysTours, wordCloud, todayCalls });
+        res.json({
+            needsAttention,
+            actionNeeded,
+            todaysTours,
+            wordCloud,
+            todayCalls,
+            hotLeads: actionNeeded.filter((call) => call.isHotLead),
+        });
+        console.log(
+            `[DailyInsights] school=${schoolId} actionNeeded=${actionNeeded.length} tours=${todaysTours.length} todayCalls=${todayCalls.length} ${Date.now() - startedAt}ms`
+        );
     } catch (err) {
         console.error('Daily insights error:', err);
         res.status(500).json({ error: 'Internal server error' });
@@ -1024,103 +869,12 @@ router.get('/action-needed', async (req, res) => {
         // Get calls from the last 30 days that need action
         const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
 
-        const actionNeededWebhooks = await ElevenLabsWebhook.find({
-            type: 'post_call_transcription',
-            received_at: { $gte: thirtyDaysAgo },
-            tour_booking_detected: { $ne: true },
-            actionTaken: { $ne: true }, // Only show items not yet marked as action taken
-            schoolId: schoolObjectId
-        }).sort({ received_at: -1 }).lean();
+        const actionNeeded = await loadActionNeededCalls(schoolObjectId, backendUrl, userToken);
 
-        // Extract comprehensive data from transcripts using single prompt
-        const actionNeeded = await Promise.all(actionNeededWebhooks.map(async (wh) => {
-            const transcriptText = Array.isArray(wh.transcript) 
-                ? wh.transcript.map(t => `${t.role}: ${t.message || t.text}`).join('\n')
-                : '';
-
-            let comprehensiveData = { tags: [], childName: '', childAge: '', language: '', missingDetails: [] };
-
-            // Use stable cached comprehensive data if available, otherwise extract once and persist.
-            if (hasStableTagCache(wh)) {
-                comprehensiveData = buildCachedComprehensiveData(wh);
-            } else if (transcriptText) {
-                // Extract and cache if no cached data exists
-                try {
-                    comprehensiveData = await extractTourDetails(transcriptText, {
-                        childName: wh.tour_booking_extracted?.childName || '',
-                        childAge: wh.tour_booking_extracted?.childAge || '',
-                        purpose: wh.summary || ''
-                    });
-
-                    // Post-processing: Remove "No child info captured" tag if child info is present
-                    if (comprehensiveData.childName && comprehensiveData.childAge) {
-                        comprehensiveData.tags = comprehensiveData.tags.filter(tag =>
-                            !tag.toLowerCase().includes('no child info')
-                        );
-                    }
-
-                    // Post-processing: Ensure "No child info captured" tag is applied if child info is missing
-                    if ((!comprehensiveData.childName || !comprehensiveData.childAge) &&
-                        (comprehensiveData.missingDetails &&
-                         (comprehensiveData.missingDetails.some(m => m.toLowerCase().includes('child name')) ||
-                          comprehensiveData.missingDetails.some(m => m.toLowerCase().includes('child age'))))) {
-                        if (!comprehensiveData.tags.some(tag => tag.toLowerCase().includes('no child info'))) {
-                            comprehensiveData.tags.push('No child info captured');
-                        }
-                    }
-
-                    // Post-processing: Ensure "Partial call" tag is applied if missing_details has any field
-                    if (comprehensiveData.missingDetails && comprehensiveData.missingDetails.length > 0) {
-                        if (!comprehensiveData.tags.some(tag => tag.toLowerCase().includes('partial call'))) {
-                            comprehensiveData.tags.push('Partial call');
-                        }
-                    }
-
-                    // Cache the extracted data to the webhook document
-                    await ElevenLabsWebhook.findByIdAndUpdate(wh._id, {
-                        ai_processed: true,
-                        extractedTags: comprehensiveData.tags,
-                        extractedChildName: comprehensiveData.childName,
-                        extractedChildAge: comprehensiveData.childAge,
-                        extractedLanguage: comprehensiveData.language,
-                        extractedMissingDetails: comprehensiveData.missingDetails
-                    }).catch(err => console.error('[ACTION-NEEDED] Failed to cache comprehensive data:', err));
-                } catch (err) {
-                    console.error('[ACTION-NEEDED] Failed to extract comprehensive data:', err);
-                }
-            }
-
-            return {
-                id: wh._id.toString(),
-                conversationId: wh.conversation_id,
-                callerName: wh.tour_booking_extracted?.name || 'Parent',
-                callerPhone: wh.metadata?.phone_call?.from_number || wh.tour_booking_extracted?.phone || 'Unknown',
-                summary: wh.summary || '',
-                timestamp: wh.metadata?.start_time_unix_secs
-                    ? new Date(wh.metadata.start_time_unix_secs * 1000)
-                    : wh.received_at,
-                recordingUrl: wh.conversation_id
-                    ? `${backendUrl}/api/school/calls/${wh.conversation_id}/audio?token=${userToken}`
-                    : null,
-                duration: getCallDurationSeconds(wh),
-                questionsAsked: mergeQuestionLists(
-                    comprehensiveData.questionsAsked,
-                    mergeParentQuestionsFromExtraction(wh.comprehensive_result, {
-                        summaryText: wh.summary || ''
-                    })
-                ),
-                actionTakenFeedback: wh.actionTakenFeedback || undefined,
-                actionTakenAt: wh.actionTakenAt || undefined,
-                feedbackHistory: wh.feedbackHistory || undefined,
-                tags: comprehensiveData.tags,
-                childName: comprehensiveData.childName,
-                childAge: comprehensiveData.childAge,
-                language: comprehensiveData.language,
-                missingDetails: comprehensiveData.missingDetails
-            };
-        }));
-
-        res.json({ actionNeeded });
+        res.json({
+            actionNeeded,
+            hotLeads: actionNeeded.filter((call) => call.isHotLead),
+        });
     } catch (err) {
         console.error('Action needed error:', err);
         res.status(500).json({ error: 'Internal server error' });
@@ -1158,6 +912,8 @@ router.post('/action-needed/:id/mark-action-taken', async (req, res) => {
         if (!webhook) {
             return res.status(404).json({ error: 'Action needed item not found' });
         }
+
+        await markLeadInsightActionTaken(webhook._id, feedback || '');
 
         res.json({ 
             success: true, 
@@ -1227,6 +983,7 @@ router.delete('/action-needed/:id', async (req, res) => {
         });
 
         console.log(`[DELETE] Permanently deleted webhook ${id} from school ${schoolId}`);
+        await removeLeadInsightForWebhook(webhookObjectId);
         
         res.json({ 
             success: true, 
@@ -1393,7 +1150,7 @@ router.get('/call-logs', async (req, res) => {
             return {
                 id: wh._id.toString(),
                 sessionId: wh.conversation_id,
-                participantId: wh.metadata?.phone_call?.from_number || wh.tour_booking_extracted?.phone || 'Web Widget',
+                participantId: getCallerPhoneFromWebhook(wh, 'Unknown'),
                 transcript,
                 summary: wh.summary || '',
                 recordingUrl: `${backendUrl}/api/school/calls/${wh.conversation_id}/audio?token=${userToken}`,
@@ -1410,7 +1167,7 @@ router.get('/call-logs', async (req, res) => {
         });
 
         webhookSessions.forEach(ws => {
-            const key = `${normalizePhone(ws.participantId)}_${new Date(ws.createdAt).getTime()}`;
+            const key = ws.sessionId || `${normalizePhone(ws.participantId)}_${new Date(ws.createdAt).getTime()}`;
             if (finalSessionsMap.has(key)) {
                 const existing = finalSessionsMap.get(key);
                 // Merge transcript and recording if webhook has better data
@@ -1646,7 +1403,7 @@ router.get('/settings', async (req, res) => {
             emailTemplate: school.emailTemplate || 'Dear {parent_name},\n\nThank you for contacting us regarding enrollment at {school_name}.\n\nPlease find the inquiry form at: {form_link}\n\nWarm regards,\n{school_name}',
             qaPairs,
             knowledgeBaseDocumentId: school.knowledgeBaseDocumentId || '',
-            adminEmail: school.adminEmail || '',
+            adminEmail: (school.adminEmail || '').trim(),
             preferredCalendar: school.preferredCalendar || 'google',
             preferredEmailProvider: school.preferredEmailProvider || 'google',
             elevenlabsAgentId: school.elevenlabsAgentId || '',
@@ -1692,6 +1449,10 @@ router.put('/settings', async (req, res) => {
             enableHumanTransfer, humanTransferCondition, humanTransferPhoneNumber
         } = req.body;
 
+        const adminEmailUpdate = adminEmail !== undefined
+            ? String(adminEmail || '').trim()
+            : null;
+
         // Capture old values BEFORE overwriting (for change detection)
         const oldAddress = school.address;
         const oldEnableHumanTransfer = Boolean(school.enableHumanTransfer);
@@ -1729,7 +1490,7 @@ router.put('/settings', async (req, res) => {
         if (emailTemplate !== undefined) school.emailTemplate = emailTemplate;
         if (preferredCalendar !== undefined) school.preferredCalendar = preferredCalendar;
         if (preferredEmailProvider !== undefined) school.preferredEmailProvider = preferredEmailProvider;
-        if (adminEmail !== undefined) school.adminEmail = String(adminEmail || '').trim();
+        if (adminEmailUpdate !== null) school.adminEmail = adminEmailUpdate;
         if (elevenlabsAgentId !== undefined) school.elevenlabsAgentId = elevenlabsAgentId;
         if (enableHumanTransfer !== undefined) school.enableHumanTransfer = Boolean(enableHumanTransfer);
         if (humanTransferCondition !== undefined) school.humanTransferCondition = String(humanTransferCondition || '').trim();
@@ -1859,10 +1620,16 @@ router.put('/settings', async (req, res) => {
         await school.save();
         console.log('[PUT /settings] Saved successfully. qaPairs in DB:', school.qaPairs.length);
 
+        // Persist adminEmail atomically after save so concurrent settings updates cannot overwrite it.
+        if (adminEmailUpdate !== null) {
+            await School.findByIdAndUpdate(schoolId, { $set: { adminEmail: adminEmailUpdate } });
+            school.adminEmail = adminEmailUpdate;
+        }
+
         res.json({
             message: 'Settings updated successfully',
             qaPairsCount: school.qaPairs.length,
-            adminEmail: school.adminEmail || '',
+            adminEmail: (school.adminEmail || '').trim(),
             language: school.language || 'EN',
         });
     } catch (err) {

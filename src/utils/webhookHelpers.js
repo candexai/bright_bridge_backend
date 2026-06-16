@@ -34,4 +34,29 @@ function getCallDurationSeconds(webhook) {
     return 0;
 }
 
-module.exports = { getCallDurationSeconds };
+/**
+ * Resolve the caller's phone number from an ElevenLabs webhook document.
+ * ElevenLabs SIP calls often use external_number (not from_number).
+ * @param {Object} webhook - Webhook doc with metadata, user_id, tour_booking_extracted, raw_payload
+ * @param {string} [fallback='Unknown'] - Value when no phone is found
+ * @returns {string}
+ */
+function getCallerPhoneFromWebhook(webhook, fallback = 'Unknown') {
+    if (!webhook) return fallback;
+
+    const phoneCall = webhook.metadata?.phone_call || {};
+    const rawPhoneCall = webhook.raw_payload?.data?.metadata?.phone_call || {};
+
+    const phone = phoneCall.from_number
+        || phoneCall.external_number
+        || rawPhoneCall.from_number
+        || rawPhoneCall.external_number
+        || webhook.tour_booking_extracted?.phone
+        || webhook.user_id
+        || '';
+
+    const trimmed = String(phone).trim();
+    return trimmed || fallback;
+}
+
+module.exports = { getCallDurationSeconds, getCallerPhoneFromWebhook };

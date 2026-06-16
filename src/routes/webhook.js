@@ -14,6 +14,7 @@ const { sendEmail } = require('../services/mailService');
 const { generateICS } = require('../utils/ics');
 const { parseLocalDateTimeToUTC } = require('../utils/timezone');
 const { deductCallMinutes } = require('../services/billingService');
+const { mapComprehensiveResult, upsertLeadInsight } = require('../services/leadInsightService');
 const jwt = require('jsonwebtoken');
 const JWT_SECRET = process.env.JWT_SECRET || 'childcare-enrollment-ai-secret-key-2024';
 
@@ -249,6 +250,15 @@ async function processTranscriptWithAI(webhookId, transcriptArray) {
         console.log(`[Webhook AI] Summary generated: ${aiResult.summary ? 'Yes' : 'No'}`);
         console.log(`[Webhook AI] Tour booking detected: ${aiResult.tour_booking_detected}`);
 
+        if (updatedWebhook?.schoolId && aiResult.comprehensive_result) {
+            const insightData = mapComprehensiveResult(aiResult.comprehensive_result, updatedWebhook);
+            upsertLeadInsight({
+                schoolId: updatedWebhook.schoolId,
+                webhook: updatedWebhook,
+                insightData,
+            }).catch((err) => console.error('[Webhook AI] Failed to cache lead insight:', err.message));
+        }
+
         if (aiResult.tour_booking_detected && aiResult.tour_booking_date) {
             console.log(`[Webhook AI] Tour booking date: ${aiResult.tour_booking_date}`);
 
@@ -436,8 +446,7 @@ async function createTourBookingFromWebhook(webhook, aiResult) {
         console.log('[Webhook Booking] Using extracted info:', extracted);
 
         // Parent's phone is 'from_number' for inbound calls
-        const phoneCall = webhook.metadata?.phone_call || {};
-        const callerPhone = phoneCall.from_number || '';
+        const callerPhone = getCallerPhoneFromWebhook(webhook, '');
         const phone = extracted.phone || callerPhone || '';
         const parentName = extracted.name || 'Parent';
 
@@ -674,7 +683,7 @@ async function sendEmailViaGmail(schoolId, to, subject, text) {
     }
 }
 
-const { getCallDurationSeconds } = require('../utils/webhookHelpers');
+const { getCallDurationSeconds, getCallerPhoneFromWebhook } = require('../utils/webhookHelpers');
 
 /**
  * Send email notification to admin when webhook is received and processed
@@ -759,10 +768,7 @@ async function sendAdminEmailNotification(webhook, aiResult = null) {
         }
         const callDurationMin = Math.floor(callDuration / 60);
         const callDurationSec = callDuration % 60;
-        let callerNumber = webhook.metadata?.phone_call?.from_number
-            || webhook.metadata?.phone_call?.external_number
-            || aiResult?.tour_booking_extracted?.phone
-            || 'Unknown (Web Widget)';
+        let callerNumber = getCallerPhoneFromWebhook(webhook, 'Unknown (Web Widget)');
 
         const receivedAt = webhook.received_at ? new Date(webhook.received_at).toLocaleString() : new Date().toLocaleString();
 
