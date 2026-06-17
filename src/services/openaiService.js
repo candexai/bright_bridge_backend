@@ -1,5 +1,13 @@
 const axios = require('axios');
 const { getComprehensivePrompt } = require('../utils/comprehensivePrompt');
+const {
+    isCurrentFamilyTransferCall,
+    isCurrentFamilyCall,
+    buildCurrentFamilyTransferResult,
+    isNoMeaningfulInteractionSummary,
+    callerIdentifiedAsCurrentFamily,
+    getCallerTextFromTranscript,
+} = require('../utils/currentFamilyTransfer');
 const AlertService = require('./alertService');
 
 function reportOpenAIAlert(err, context = {}) {
@@ -76,8 +84,17 @@ async function processTranscriptComprehensive(transcriptArray) {
         const wordCount = transcriptText.split(/\s+/).filter(word => word.length > 0).length;
         const transcriptLength = transcriptText.length;
         
+        if (isCurrentFamilyCall(transcriptArray)) {
+            console.log('[OpenAI] Current family call detected. Returning transfer summary.');
+            return buildCurrentFamilyTransferResult(transcriptArray);
+        }
+
         // If transcript is very short, return minimal information without calling AI
         if (transcriptLength < 50 || wordCount < 10) {
+            if (isCurrentFamilyCall(transcriptArray)) {
+                console.log('[OpenAI] Short current-family call detected. Returning transfer summary.');
+                return buildCurrentFamilyTransferResult(transcriptArray);
+            }
             console.log(`[OpenAI] Transcript too short (${wordCount} words, ${transcriptLength} chars). Returning minimal response.`);
             return {
                 call_state: "no_interaction",
@@ -150,6 +167,13 @@ async function processTranscriptComprehensive(transcriptArray) {
 
         // Parse JSON response
         const result = JSON.parse(content);
+        if (
+            (result.call_state === 'no_interaction' || isNoMeaningfulInteractionSummary(result.summary))
+            && isCurrentFamilyCall(transcriptArray)
+        ) {
+            console.log('[OpenAI] Overriding no-interaction result for current family transfer call.');
+            return buildCurrentFamilyTransferResult(transcriptArray);
+        }
         console.log('[OpenAI] Comprehensive processing completed successfully');
         return result;
 

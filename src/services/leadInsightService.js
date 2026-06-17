@@ -2,12 +2,12 @@ const crypto = require('crypto');
 const LeadInsight = require('../models/LeadInsight');
 const { extractTourDetails, mergeParentQuestionsFromExtraction } = require('../utils/openai');
 const { getCallerPhoneFromWebhook, getCallDurationSeconds } = require('../utils/webhookHelpers');
+const { resolveWebhookSummary, resolveCachedSummary } = require('../utils/currentFamilyTransfer');
 
-const HOT_LEAD_TAG_PATTERNS = [
+const HOT_LEAD_AI_TAG_PATTERNS = [
     /hot lead/i,
     /parent requested callback/i,
     /callback requested/i,
-    /callback/i,
     /enrollment inquiry/i,
     /admission/i,
     /urgent follow[- ]?up/i,
@@ -16,20 +16,31 @@ const HOT_LEAD_TAG_PATTERNS = [
     /urgency:\s*high/i,
     /tour requested/i,
     /price (concern|sensitive)/i,
-    /tuition/i,
     /price inquiry/i,
 ];
 
-const HOT_LEAD_TEXT_PATTERNS = [
-    /enroll/i,
-    /admission/i,
-    /callback/i,
-    /call (me )?back/i,
-    /urgent/i,
-    /as soon as possible/i,
-    /starting (next week|soon)/i,
-    /tuition|price|cost|fee/i,
-    /schedule.*tour|book.*tour/i,
+/** New-parent enrollment / tour intent — word boundaries so "enrolled" does not match. */
+const NEW_PARENT_INTENT_PATTERNS = [
+    /\benroll(?:ment|ing)?\b/i,
+    /\badmission\b/i,
+    /\btour\b/i,
+    /\bvisit(?:ing)?\b|\bschedule\b|\bbook(?:ing)?\b/i,
+    /tuition|price|cost|fee|afford|financial aid/i,
+    /callback|call (?:me )?back|speak (?:to|with) (?:someone|staff|a person)/i,
+    /urgent|as soon as possible|starting (?:next week|soon)/i,
+    /program|curriculum|classroom|hours|pickup|drop.?off|meal|food|ratio|teacher|camera|security|summer camp|after.?school/i,
+];
+
+/** Current-family calls only count as hot when they ask about something substantive. */
+const CURRENT_FAMILY_INQUIRY_PATTERNS = [
+    /tuition|price|cost|fee|billing|payment|invoice/i,
+    /hours|schedule|pickup|drop.?off|holiday|closure|\bopen\b|\bclose\b/i,
+    /meal|food|allerg|lunch|snack/i,
+    /teacher|ratio|classroom|director|staff/i,
+    /camera|security|safety|incident/i,
+    /bus|transportation|field trip/i,
+    /summer camp|after.?school|extended care/i,
+    /sick|absence|attendance/i,
 ];
 
 function hashTranscript(transcriptText) {
@@ -46,7 +57,7 @@ function getCallerText(webhook) {
     return webhook.transcript
         .filter((entry) => {
             const role = String(entry.role || '').toLowerCase();
-            return role === 'user' || role === 'parent' || role === 'caller';
+            return role === 'user' || role === 'parent' || role === 'caller' || role === 'customer' || role === 'human';
         })
         .map((entry) => entry.message || entry.text || '')
         .join(' ');
@@ -83,22 +94,69 @@ function safeStr(value) {
     return String(value || '');
 }
 
-function detectHotLead(tags, summary, callerText) {
-    const tagHaystack = (Array.isArray(tags) ? tags : []).join(' ').toLowerCase();
-    if (HOT_LEAD_TAG_PATTERNS.some((pattern) => pattern.test(tagHaystack))) {
-        return true;
+function dedupeTags(tags) {
+    const seen = new Set();
+    const out = [];
+    for (const tag of Array.isArray(tags) ? tags : []) {
+        const label = String(tag || '').trim();
+        if (!label) continue;
+        const key = label.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(label);
     }
+    return out;
+}
 
+function isTransferBoilerplateSummary(summary) {
+    return /current enrolled family member|transferred to the front desk|familia actual/i.test(String(summary || ''));
+}
+
+function detectHotLead({
+    tags = [],
+    summary = '',
+    callerText = '',
+    parentSegment = 'new_parent',
+    questionsAsked = [],
+    missingDetails = [],
+} = {}) {
+    const tagHaystack = (Array.isArray(tags) ? tags : []).join(' ').toLowerCase();
     const summaryText = String(summary || '').toLowerCase();
+
     if (/no meaningful interaction|did not engage|call was interrupted|caller did not/i.test(summaryText)) {
         return false;
     }
-    if (HOT_LEAD_TEXT_PATTERNS.some((pattern) => pattern.test(summaryText))) {
+
+    const questionsHaystack = (Array.isArray(questionsAsked) ? questionsAsked : []).join(' ').toLowerCase();
+    const callerHaystack = String(callerText || '').toLowerCase();
+    const inquiryHaystack = `${callerHaystack} ${questionsHaystack}`.trim();
+
+    if (parentSegment === 'current_family') {
+        if (!inquiryHaystack) return false;
+        return CURRENT_FAMILY_INQUIRY_PATTERNS.some((pattern) => pattern.test(inquiryHaystack));
+    }
+
+    const hasNoChildInfo = tagHaystack.includes('no child info')
+        || (Array.isArray(missingDetails) && missingDetails.some((m) => /child name|child age/i.test(String(m))));
+    const isPartial = tagHaystack.includes('partial call');
+    const hasIntent = NEW_PARENT_INTENT_PATTERNS.some((pattern) => pattern.test(inquiryHaystack));
+    const hasRealQuestions = questionsAsked.length > 0
+        && inquiryHaystack.replace(/\b(current family|familia actual)\b/gi, '').trim().length > 15;
+
+    if (isPartial && hasNoChildInfo && !hasIntent && !hasRealQuestions) {
+        return false;
+    }
+
+    if (HOT_LEAD_AI_TAG_PATTERNS.some((pattern) => pattern.test(tagHaystack))) {
         return true;
     }
 
-    const callerHaystack = String(callerText || '').toLowerCase();
-    return HOT_LEAD_TEXT_PATTERNS.some((pattern) => pattern.test(callerHaystack));
+    if (!isTransferBoilerplateSummary(summaryText)
+        && NEW_PARENT_INTENT_PATTERNS.some((pattern) => pattern.test(summaryText))) {
+        return true;
+    }
+
+    return hasIntent || hasRealQuestions;
 }
 
 function callerIdentifiedAsCurrentFamily(callerText) {
@@ -157,6 +215,7 @@ function detectParentSegment(tags, summary, webhookOrCallerText) {
         || /\bexisting family\b/i.test(summaryText)
         || /\balready enrolled\b/i.test(summaryText)
         || /\bcurrent parent\b/i.test(summaryText)
+        || /\bcurrent enrolled family\b/i.test(summaryText)
         || /\bcurrent family\b/i.test(summaryText)
         || /connect(?:ed)? (?:them |(?:the )?caller )?to the front desk/i.test(summaryText)
         || /requested (?:to speak with |)the front desk/i.test(summaryText)
@@ -172,9 +231,10 @@ function detectParentSegment(tags, summary, webhookOrCallerText) {
 }
 
 function enrichTags(tags, isHotLead, parentSegment) {
-    const next = [...(Array.isArray(tags) ? tags : [])];
+    let next = dedupeTags(Array.isArray(tags) ? tags : []);
     const hasTag = (label) => next.some((tag) => tag.toLowerCase() === label.toLowerCase());
 
+    next = next.filter((tag) => tag.toLowerCase() !== 'hot lead');
     if (isHotLead && !hasTag('Hot Lead')) {
         next.unshift('Hot Lead');
     }
@@ -185,7 +245,7 @@ function enrichTags(tags, isHotLead, parentSegment) {
         next.push('New Parent');
     }
 
-    return next;
+    return dedupeTags(next);
 }
 
 function applyTagPostProcessing(comprehensiveData) {
@@ -212,82 +272,108 @@ function applyTagPostProcessing(comprehensiveData) {
         }
     }
 
+    data.tags = dedupeTags(data.tags);
+    if (!data.isHotLead) {
+        data.tags = data.tags.filter((tag) => tag.toLowerCase() !== 'hot lead');
+    }
+
     return data;
 }
 
-function mapComprehensiveResult(comprehensiveResult, webhook) {
+function mapInsightFields(webhook, { tags = [], comprehensiveResult = null, summaryText = '' } = {}) {
     const callerText = getCallerText(webhook);
-    const tags = comprehensiveResult?.tags || [];
-    const isHotLead = detectHotLead(tags, comprehensiveResult?.summary || webhook?.summary, callerText);
-    const parentSegment = detectParentSegment(tags, comprehensiveResult?.summary || webhook?.summary, webhook);
-
-    const data = applyTagPostProcessing({
-        tags: enrichTags(tags, isHotLead, parentSegment),
-        childName: safeStr(comprehensiveResult?.child_name) || webhook?.tour_booking_extracted?.childName || '',
-        childAge: safeStr(comprehensiveResult?.child_age) || webhook?.tour_booking_extracted?.childAge || '',
-        language: comprehensiveResult?.language_spoken || '',
-        missingDetails: Array.isArray(comprehensiveResult?.missing_details) ? comprehensiveResult.missing_details : [],
-        questionsAsked: mergeParentQuestionsFromExtraction(comprehensiveResult, {
-            summaryText: comprehensiveResult?.summary || webhook?.summary || '',
-        }),
-        isHotLead,
-        parentSegment,
+    const resolvedSummary = summaryText || comprehensiveResult?.summary || resolveWebhookSummary(webhook);
+    const parentSegment = detectParentSegment(tags, resolvedSummary, webhook);
+    const questionsAsked = mergeParentQuestionsFromExtraction(comprehensiveResult, {
+        summaryText: resolvedSummary,
     });
+    const missingDetails = Array.isArray(comprehensiveResult?.missing_details)
+        ? comprehensiveResult.missing_details
+        : (Array.isArray(webhook?.extractedMissingDetails) ? webhook.extractedMissingDetails : []);
 
-    return data;
-}
-
-function mapWebhookExtractedFields(webhook) {
-    const callerText = getCallerText(webhook);
-    const tags = webhook?.extractedTags || [];
-    const isHotLead = detectHotLead(tags, webhook?.summary, callerText);
-    const parentSegment = detectParentSegment(tags, webhook?.summary, webhook);
+    const isHotLead = detectHotLead({
+        tags,
+        summary: resolvedSummary,
+        callerText,
+        parentSegment,
+        questionsAsked,
+        missingDetails,
+    });
 
     return applyTagPostProcessing({
         tags: enrichTags(tags, isHotLead, parentSegment),
-        childName: webhook?.extractedChildName || webhook?.tour_booking_extracted?.childName || '',
-        childAge: webhook?.extractedChildAge || webhook?.tour_booking_extracted?.childAge || '',
-        language: webhook?.extractedLanguage || '',
-        missingDetails: Array.isArray(webhook?.extractedMissingDetails) ? webhook.extractedMissingDetails : [],
-        questionsAsked: mergeParentQuestionsFromExtraction(webhook?.comprehensive_result, {
-            summaryText: webhook?.summary || '',
-        }),
+        childName: safeStr(comprehensiveResult?.child_name)
+            || webhook?.extractedChildName
+            || webhook?.tour_booking_extracted?.childName
+            || '',
+        childAge: safeStr(comprehensiveResult?.child_age)
+            || webhook?.extractedChildAge
+            || webhook?.tour_booking_extracted?.childAge
+            || '',
+        language: comprehensiveResult?.language_spoken || webhook?.extractedLanguage || '',
+        missingDetails,
+        questionsAsked,
         isHotLead,
         parentSegment,
+    });
+}
+
+function mapComprehensiveResult(comprehensiveResult, webhook) {
+    return mapInsightFields(webhook, {
+        tags: comprehensiveResult?.tags || [],
+        comprehensiveResult,
+        summaryText: comprehensiveResult?.summary || resolveWebhookSummary(webhook),
+    });
+}
+
+function mapWebhookExtractedFields(webhook) {
+    return mapInsightFields(webhook, {
+        tags: webhook?.extractedTags || [],
+        comprehensiveResult: webhook?.comprehensive_result || null,
+        summaryText: resolveWebhookSummary(webhook),
     });
 }
 
 function mapSummaryFallback(webhook) {
-    const callerText = getCallerText(webhook);
-    const tags = [];
-    const isHotLead = detectHotLead(tags, webhook?.summary, callerText);
-    const parentSegment = detectParentSegment(tags, webhook?.summary, webhook);
+    return mapInsightFields(webhook, {
+        tags: [],
+        comprehensiveResult: webhook?.comprehensive_result || null,
+        summaryText: resolveWebhookSummary(webhook),
+    });
+}
 
-    return applyTagPostProcessing({
-        tags: enrichTags(tags, isHotLead, parentSegment),
-        childName: webhook?.tour_booking_extracted?.childName || '',
-        childAge: webhook?.tour_booking_extracted?.childAge || '',
-        language: '',
-        missingDetails: [],
-        questionsAsked: mergeParentQuestionsFromExtraction(webhook?.comprehensive_result, {
-            summaryText: webhook?.summary || '',
-        }),
+function sanitizeCachedInsight(doc) {
+    const parentSegment = doc.parentSegment || 'new_parent';
+    const tags = doc.tags || [];
+    const questionsAsked = doc.questionsAsked || [];
+    const missingDetails = doc.missingDetails || [];
+    const isHotLead = detectHotLead({
+        tags,
+        summary: doc.summary || '',
+        callerText: '',
+        parentSegment,
+        questionsAsked,
+        missingDetails,
+    });
+    return {
+        tags: enrichTags(tags.filter((t) => t.toLowerCase() !== 'hot lead'), isHotLead, parentSegment),
         isHotLead,
         parentSegment,
-    });
+    };
 }
 
 function mapLeadInsightDoc(doc) {
     if (!doc) return null;
+    const sanitized = sanitizeCachedInsight(doc);
     return {
-        tags: doc.tags || [],
+        tags: sanitized.tags,
         childName: doc.childName || '',
         childAge: doc.childAge || '',
         language: doc.language || '',
         missingDetails: doc.missingDetails || [],
         questionsAsked: doc.questionsAsked || [],
-        isHotLead: Boolean(doc.isHotLead),
-        parentSegment: doc.parentSegment || 'new_parent',
+        isHotLead: sanitized.isHotLead,
+        parentSegment: sanitized.parentSegment,
         aiProcessed: Boolean(doc.aiProcessed),
     };
 }
@@ -296,7 +382,7 @@ function buildInsightSnapshot(webhook) {
     return {
         callerName: webhook.tour_booking_extracted?.name || webhook.comprehensive_result?.parent_name || 'Parent',
         callerPhone: getCallerPhoneFromWebhook(webhook, 'Unknown'),
-        summary: webhook.summary || '',
+        summary: resolveWebhookSummary(webhook),
         callTimestamp: webhook.metadata?.start_time_unix_secs
             ? new Date(webhook.metadata.start_time_unix_secs * 1000)
             : (webhook.received_at || new Date()),
@@ -360,10 +446,21 @@ async function buildInsightDataForWebhook(webhook, { allowOpenAI = false } = {})
                 purpose: webhook?.summary || '',
             });
             const callerText = getCallerText(webhook);
-            const isHotLead = detectHotLead(extracted.tags, webhook?.summary, callerText);
             const parentSegment = detectParentSegment(extracted.tags, webhook?.summary, webhook);
+            const questionsAsked = mergeParentQuestionsFromExtraction(extracted, {
+                summaryText: webhook?.summary || '',
+            });
+            const isHotLead = detectHotLead({
+                tags: extracted.tags || [],
+                summary: webhook?.summary,
+                callerText,
+                parentSegment,
+                questionsAsked,
+                missingDetails: extracted.missingDetails || [],
+            });
             const data = applyTagPostProcessing({
                 ...extracted,
+                questionsAsked,
                 tags: enrichTags(extracted.tags || [], isHotLead, parentSegment),
                 isHotLead,
                 parentSegment,
@@ -440,14 +537,16 @@ async function resolveInsightsForWebhooks(webhooks, schoolId, options = {}) {
     return resolved;
 }
 
-function buildActionNeededCallFromInsight(row, backendUrl, userToken) {
+function buildActionNeededCallFromInsight(row, backendUrl, userToken, webhook = null) {
     const conversationId = row.conversationId || '';
+    const sanitized = sanitizeCachedInsight(row);
+    const summary = resolveCachedSummary(row, webhook);
     return {
         id: String(row.webhookId),
         conversationId: conversationId || null,
         callerName: row.callerName || 'Parent',
         callerPhone: row.callerPhone || 'Unknown',
-        summary: row.summary || '',
+        summary,
         timestamp: row.callTimestamp || row.processedAt || new Date(),
         recordingUrl: conversationId
             ? `${backendUrl}/api/school/calls/${conversationId}/audio?token=${userToken}`
@@ -458,13 +557,13 @@ function buildActionNeededCallFromInsight(row, backendUrl, userToken) {
         actionTakenAt: row.actionTakenAt || null,
         actionTakenFeedback: row.actionTakenFeedback || '',
         feedbackHistory: undefined,
-        tags: row.tags || [],
+        tags: sanitized.tags,
         childName: row.childName || '',
         childAge: row.childAge || '',
         language: row.language || '',
         missingDetails: row.missingDetails || [],
-        isHotLead: Boolean(row.isHotLead),
-        parentSegment: row.parentSegment || 'new_parent',
+        isHotLead: sanitized.isHotLead,
+        parentSegment: sanitized.parentSegment,
         aiProcessed: Boolean(row.aiProcessed ?? true),
     };
 }
@@ -489,7 +588,20 @@ async function loadActionNeededCalls(schoolObjectId, backendUrl, userToken, opti
         .lean();
 
     if (cachedRows.length > 0) {
-        return cachedRows.map((row) => buildActionNeededCallFromInsight(row, backendUrl, userToken));
+        const webhookIds = cachedRows.map((row) => row.webhookId).filter(Boolean);
+        const webhooks = await ElevenLabsWebhook.find({ _id: { $in: webhookIds } })
+            .select('_id conversation_id summary transcript comprehensive_result tour_booking_extracted metadata received_at user_id')
+            .lean();
+        const webhookMap = new Map(webhooks.map((wh) => [String(wh._id), wh]));
+
+        return cachedRows.map((row) =>
+            buildActionNeededCallFromInsight(
+                row,
+                backendUrl,
+                userToken,
+                webhookMap.get(String(row.webhookId)) || null
+            )
+        );
     }
 
     const webhooks = await ElevenLabsWebhook.find({
@@ -538,7 +650,7 @@ function buildActionNeededCall(webhook, insight, backendUrl, userToken) {
         conversationId: webhook.conversation_id,
         callerName: webhook.tour_booking_extracted?.name || webhook.comprehensive_result?.parent_name || 'Parent',
         callerPhone: getCallerPhoneFromWebhook(webhook, 'Unknown'),
-        summary: webhook.summary || '',
+        summary: resolveWebhookSummary(webhook),
         timestamp: webhook.metadata?.start_time_unix_secs
             ? new Date(webhook.metadata.start_time_unix_secs * 1000)
             : webhook.received_at,

@@ -21,7 +21,15 @@ Determine the call state:
 
 - "complete": All 5 required fields collected (caller name, phone, email, child name, child age) AND call ended normally
 - "partial": Some fields collected but call ended early, parent hung up, or booking was not completed
-- "no_interaction": Caller said nothing meaningful (only greetings, silence, background noise, or misdial)
+- "no_interaction": Caller said nothing meaningful (only greetings, silence, background noise, or misdial). NEVER use this when the caller identified as a current enrolled family member — even if the call was brief or ended after a front-desk transfer.
+
+CURRENT ENROLLED FAMILY TRANSFERS:
+
+- If the caller says they are a current family, existing family, already enrolled, or "familia actual", and Nora connects or transfers them to the front desk, this IS meaningful interaction.
+- call_state: use "partial" (not "no_interaction").
+- tags: MUST include "Current Family".
+- summary: state clearly that the caller identified as a current enrolled family member and that the call was transferred (or Nora offered to connect them) to the front desk. If the caller asked any other questions before or during the call, include those in the summary and in questions_asked.
+- NEVER write "No meaningful interaction" for these calls.
 
 Required fields to extract (set to null if not mentioned):
 
@@ -76,7 +84,7 @@ FAIL-SAFE RULES - Apply these ALWAYS, no exceptions:
 
 CONDITIONAL RULES - MANDATORY when conditions are met (apply ALL tags whose conditions are satisfied):
 
-- "Hot lead" - MANDATORY if parent shows strong interest, asks detailed questions, or mentions immediate enrollment needs
+- "Hot lead" - MANDATORY if parent shows strong interest, asks detailed questions, or mentions immediate enrollment needs. NEVER apply to current enrolled family calls that only requested a front-desk transfer with no pricing, facility, or program questions.
 - "Urgency: Immediate" - MANDATORY if parent needs enrollment ASAP (e.g., "starting next week", "as soon as possible", "immediate")
 - "Urgency: High" - MANDATORY if parent needs enrollment soon (within 1-2 months)
 - "Urgency: Medium" - MANDATORY if parent is planning ahead (3-6 months)
@@ -98,7 +106,9 @@ Generate three outputs from this data:
 
 - Partial call: what was collected, note that the call ended before completion
 
-- No interaction: state clearly "No meaningful interaction. The call was interrupted or the caller did not engage."
+- No interaction: state clearly "No meaningful interaction. The call was interrupted or the caller did not engage." (Never use this for current-family transfer calls.)
+
+- Current family transfer: e.g. "The caller identified as a current enrolled family member. The call was transferred to the front desk." Include any additional questions they asked.
 
 2. email (object):
 

@@ -19,6 +19,7 @@ const AiNumberRequest = require('../models/AiNumberRequest');
 const { authMiddleware, schoolOnly } = require('../middleware/auth');
 const { getGoogleAuthUrl, getOutlookAuthUrl } = require('./integrations');
 const { getCallDurationSeconds, getCallerPhoneFromWebhook } = require('../utils/webhookHelpers');
+const { resolveWebhookSummary } = require('../utils/currentFamilyTransfer');
 const {
     resolveInsightsForWebhooks,
     buildActionNeededCall,
@@ -186,6 +187,48 @@ router.get('/dashboard', async (req, res) => {
         const normalizePhone = (phone) => {
             if (!phone) return '';
             return phone.replace(/\D/g, '');
+        };
+
+        const buildWebhookLookup = (webhooks) => {
+            const byConversationId = new Map();
+            const byPhone = new Map();
+            for (const wh of webhooks) {
+                if (wh.conversation_id) byConversationId.set(wh.conversation_id, wh);
+                const phone = normalizePhone(getCallerPhoneFromWebhook(wh, ''));
+                if (!phone) continue;
+                if (!byPhone.has(phone)) byPhone.set(phone, []);
+                byPhone.get(phone).push(wh);
+            }
+            return { byConversationId, byPhone };
+        };
+
+        const findWebhookForCall = (call, lookup) => {
+            if (call.conversationId && lookup.byConversationId.has(call.conversationId)) {
+                return lookup.byConversationId.get(call.conversationId);
+            }
+            const phone = normalizePhone(call.callerPhone);
+            const candidates = lookup.byPhone.get(phone) || [];
+            if (!candidates.length) return null;
+            const callTime = new Date(call.timestamp).getTime();
+            let best = null;
+            let bestDelta = Infinity;
+            for (const wh of candidates) {
+                const t = wh.metadata?.start_time_unix_secs
+                    ? wh.metadata.start_time_unix_secs * 1000
+                    : new Date(wh.received_at).getTime();
+                const delta = Math.abs(t - callTime);
+                if (delta < bestDelta && delta <= 180000) {
+                    bestDelta = delta;
+                    best = wh;
+                }
+            }
+            return best;
+        };
+
+        const resolveDashboardCallSummary = (call, lookup) => {
+            const wh = findWebhookForCall(call, lookup);
+            if (wh) return resolveWebhookSummary(wh);
+            return call.summary || '';
         };
 
         const schoolAiNumber = normalizePhone(school?.aiNumber || '');
@@ -377,7 +420,7 @@ router.get('/dashboard', async (req, res) => {
                 timestamp: callTimestamp,
                 recordingUrl: `${backendUrl}/api/school/calls/${wh.conversation_id}/audio?token=${userToken}`,
                 callType: 'inquiry',
-                summary: wh.summary || '',
+                summary: resolveWebhookSummary(wh),
                 tourBookingDetected: bookingConfirmed,
                 tourBookingDate: bookingConfirmed ? (wh.tour_booking_date || null) : null,
                 aiProcessed: wh.ai_processed || false
@@ -523,6 +566,8 @@ router.get('/dashboard', async (req, res) => {
             }
         }
 
+        const webhookLookup = buildWebhookLookup(schoolWebhooks);
+
         // Recent calls: top 20 within selected period
         const recentCalls = periodCalls
             .slice(0, 20)
@@ -535,7 +580,7 @@ router.get('/dashboard', async (req, res) => {
                 duration: Math.round(c.duration),
                 timestamp: c.timestamp,
                 recordingUrl: c.recordingUrl,
-                summary: c.summary || '',
+                summary: resolveDashboardCallSummary(c, webhookLookup),
                 tourBookingDetected: c.tourBookingDetected || false,
                 tourBookingDate: c.tourBookingDate || null,
                 aiProcessed: c.aiProcessed || false
@@ -1058,6 +1103,48 @@ router.get('/call-logs', async (req, res) => {
             if (!phone) return '';
             return phone.replace(/\D/g, '');
         };
+
+        const buildWebhookLookup = (webhooks) => {
+            const byConversationId = new Map();
+            const byPhone = new Map();
+            for (const wh of webhooks) {
+                if (wh.conversation_id) byConversationId.set(wh.conversation_id, wh);
+                const phone = normalizePhone(getCallerPhoneFromWebhook(wh, ''));
+                if (!phone) continue;
+                if (!byPhone.has(phone)) byPhone.set(phone, []);
+                byPhone.get(phone).push(wh);
+            }
+            return { byConversationId, byPhone };
+        };
+
+        const findWebhookForCall = (call, lookup) => {
+            if (call.conversationId && lookup.byConversationId.has(call.conversationId)) {
+                return lookup.byConversationId.get(call.conversationId);
+            }
+            const phone = normalizePhone(call.callerPhone);
+            const candidates = lookup.byPhone.get(phone) || [];
+            if (!candidates.length) return null;
+            const callTime = new Date(call.timestamp).getTime();
+            let best = null;
+            let bestDelta = Infinity;
+            for (const wh of candidates) {
+                const t = wh.metadata?.start_time_unix_secs
+                    ? wh.metadata.start_time_unix_secs * 1000
+                    : new Date(wh.received_at).getTime();
+                const delta = Math.abs(t - callTime);
+                if (delta < bestDelta && delta <= 180000) {
+                    bestDelta = delta;
+                    best = wh;
+                }
+            }
+            return best;
+        };
+
+        const resolveDashboardCallSummary = (call, lookup) => {
+            const wh = findWebhookForCall(call, lookup);
+            if (wh) return resolveWebhookSummary(wh);
+            return call.summary || '';
+        };
         const schoolAiNumber = normalizePhone(school.aiNumber || '');
 
         // ── 1. Fetch SIP Logs (VoiceAI) ──
@@ -1152,7 +1239,7 @@ router.get('/call-logs', async (req, res) => {
                 sessionId: wh.conversation_id,
                 participantId: getCallerPhoneFromWebhook(wh, 'Unknown'),
                 transcript,
-                summary: wh.summary || '',
+                summary: resolveWebhookSummary(wh),
                 recordingUrl: `${backendUrl}/api/school/calls/${wh.conversation_id}/audio?token=${userToken}`,
                 duration: getCallDurationSeconds(wh),
                 createdAt: wh.received_at
