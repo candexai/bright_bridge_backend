@@ -18,6 +18,7 @@ const MinuteLedger = require('../models/MinuteLedger');
 const Coupon = require('../models/Coupon');
 const CouponRedemption = require('../models/CouponRedemption');
 const { authMiddleware, adminOnly } = require('../middleware/auth');
+const { getCallerNameFromWebhook, getCallerPhoneFromWebhook } = require('../utils/webhookHelpers');
 const {
     importSipTrunk,
     deletePhoneNumber,
@@ -216,8 +217,8 @@ router.get('/dashboard', async (req, res) => {
         const formattedCalls = recentCalls.map(c => ({
             id: c._id,
             school_name: c.schoolId?.name || 'Unknown',
-            caller_name: c.tour_booking_extracted?.name || 'Parent',
-            caller_phone: c.metadata?.phone_call?.from_number || 'Unknown',
+            caller_name: getCallerNameFromWebhook(c),
+            caller_phone: getCallerPhoneFromWebhook(c, 'Unknown'),
             call_type: c.tour_booking_detected ? 'Tour Booking' : 'Inquiry',
             duration: c.metadata?.phone_call?.call_duration_secs || c.metadata?.call_duration_secs || c.metadata?.system__call_duration_secs || 0,
             timestamp: c.received_at,

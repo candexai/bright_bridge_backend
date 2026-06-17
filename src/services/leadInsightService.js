@@ -1,7 +1,7 @@
 const crypto = require('crypto');
 const LeadInsight = require('../models/LeadInsight');
 const { extractTourDetails, mergeParentQuestionsFromExtraction } = require('../utils/openai');
-const { getCallerPhoneFromWebhook, getCallDurationSeconds } = require('../utils/webhookHelpers');
+const { getCallerPhoneFromWebhook, getCallDurationSeconds, getCallerNameFromWebhook } = require('../utils/webhookHelpers');
 const { resolveWebhookSummary, resolveCachedSummary } = require('../utils/currentFamilyTransfer');
 
 const HOT_LEAD_AI_TAG_PATTERNS = [
@@ -380,7 +380,7 @@ function mapLeadInsightDoc(doc) {
 
 function buildInsightSnapshot(webhook) {
     return {
-        callerName: webhook.tour_booking_extracted?.name || webhook.comprehensive_result?.parent_name || 'Parent',
+        callerName: getCallerNameFromWebhook(webhook),
         callerPhone: getCallerPhoneFromWebhook(webhook, 'Unknown'),
         summary: resolveWebhookSummary(webhook),
         callTimestamp: webhook.metadata?.start_time_unix_secs
@@ -544,7 +544,9 @@ function buildActionNeededCallFromInsight(row, backendUrl, userToken, webhook = 
     return {
         id: String(row.webhookId),
         conversationId: conversationId || null,
-        callerName: row.callerName || 'Parent',
+        callerName: webhook
+            ? getCallerNameFromWebhook(webhook, row.callerName || 'Parent')
+            : (row.callerName || 'Parent'),
         callerPhone: row.callerPhone || 'Unknown',
         summary,
         timestamp: row.callTimestamp || row.processedAt || new Date(),
@@ -648,7 +650,7 @@ function buildActionNeededCall(webhook, insight, backendUrl, userToken) {
     return {
         id: webhook._id.toString(),
         conversationId: webhook.conversation_id,
-        callerName: webhook.tour_booking_extracted?.name || webhook.comprehensive_result?.parent_name || 'Parent',
+        callerName: getCallerNameFromWebhook(webhook),
         callerPhone: getCallerPhoneFromWebhook(webhook, 'Unknown'),
         summary: resolveWebhookSummary(webhook),
         timestamp: webhook.metadata?.start_time_unix_secs

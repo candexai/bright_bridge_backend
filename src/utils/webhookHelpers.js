@@ -1,3 +1,41 @@
+const PLACEHOLDER_CALLER_NAMES = new Set([
+    'parent',
+    'unknown',
+    'unknown caller',
+    'not provided',
+    '',
+]);
+
+function isUsableCallerName(name) {
+    const normalized = String(name || '').trim();
+    if (!normalized) return false;
+    return !PLACEHOLDER_CALLER_NAMES.has(normalized.toLowerCase());
+}
+
+/**
+ * Resolve the caller's name from an ElevenLabs webhook document.
+ * Prefers tour_booking_extracted.name, then comprehensive_result.parent_name.
+ * @param {Object} webhook
+ * @param {string} [fallback='Parent']
+ * @returns {string}
+ */
+function getCallerNameFromWebhook(webhook, fallback = 'Parent') {
+    if (!webhook) return fallback;
+
+    const candidates = [
+        webhook.tour_booking_extracted?.name,
+        webhook.comprehensive_result?.parent_name,
+    ];
+
+    for (const name of candidates) {
+        if (isUsableCallerName(name)) {
+            return String(name).trim();
+        }
+    }
+
+    return fallback;
+}
+
 /**
  * Get call duration in seconds from a webhook document.
  * ElevenLabs may send duration in different places; also fallback to transcript timestamps.
@@ -59,4 +97,9 @@ function getCallerPhoneFromWebhook(webhook, fallback = 'Unknown') {
     return trimmed || fallback;
 }
 
-module.exports = { getCallDurationSeconds, getCallerPhoneFromWebhook };
+module.exports = {
+    getCallDurationSeconds,
+    getCallerPhoneFromWebhook,
+    getCallerNameFromWebhook,
+    isUsableCallerName,
+};

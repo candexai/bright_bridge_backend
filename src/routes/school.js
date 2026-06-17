@@ -18,7 +18,12 @@ const voiceAISchema = require('../models/VoiceAI');
 const AiNumberRequest = require('../models/AiNumberRequest');
 const { authMiddleware, schoolOnly } = require('../middleware/auth');
 const { getGoogleAuthUrl, getOutlookAuthUrl } = require('./integrations');
-const { getCallDurationSeconds, getCallerPhoneFromWebhook } = require('../utils/webhookHelpers');
+const {
+    getCallDurationSeconds,
+    getCallerPhoneFromWebhook,
+    getCallerNameFromWebhook,
+    isUsableCallerName,
+} = require('../utils/webhookHelpers');
 const { resolveWebhookSummary } = require('../utils/currentFamilyTransfer');
 const {
     resolveInsightsForWebhooks,
@@ -300,7 +305,7 @@ router.get('/dashboard', async (req, res) => {
                         voiceAiCallsInner = rawLogs.map(log => ({
                             id: log._id.toString(),
                             callerPhone: log.participant_id ? log.participant_id.replace('sip_', '') : 'Unknown',
-                            callerName: resolveName(log.participant_id ? log.participant_id.replace('sip_', '') : ''),
+                            callerName: 'Parent',
                             duration: log.duration_seconds || 0,
                             timestamp: log.created_at || log.timestamp || new Date(),
                             recordingUrl: log.recording_url || null,
@@ -377,20 +382,27 @@ router.get('/dashboard', async (req, res) => {
         ]);
         const hasConnectedCalendar = connectedCalendarCount > 0;
 
-        // Create a lookup map for parent names based on normalized phone numbers
+        // Lookup map for parent names based on normalized phone numbers
         const parentNameMap = new Map();
-        actualToursBooked.forEach(tour => {
-            const normalized = normalizePhone(tour.phone);
-            if (normalized && tour.parentName && tour.parentName !== 'Parent') {
-                parentNameMap.set(normalized, tour.parentName);
-            }
-        });
-
-        // Helper to get name for a phone
-        const resolveName = (phone, specificName = null) => {
-            if (specificName && specificName !== 'Parent') return specificName;
+        const addParentName = (phone, name) => {
+            if (!isUsableCallerName(name)) return;
             const normalized = normalizePhone(phone);
-            return parentNameMap.get(normalized) || 'Parent';
+            if (normalized) parentNameMap.set(normalized, String(name).trim());
+        };
+
+        actualToursBooked.forEach(tour => addParentName(tour.phone, tour.parentName));
+        schoolWebhooks.forEach(wh => addParentName(
+            getCallerPhoneFromWebhook(wh, ''),
+            getCallerNameFromWebhook(wh, null)
+        ));
+        callLogEntries.forEach(cl => addParentName(cl.from_phone_number, cl.callerName));
+
+        const resolveName = (phone, specificName = null) => {
+            if (isUsableCallerName(specificName)) return String(specificName).trim();
+            const normalized = normalizePhone(phone);
+            const fromMap = parentNameMap.get(normalized);
+            if (isUsableCallerName(fromMap)) return fromMap;
+            return 'Parent';
         };
 
         adminEmailNotifications = adminEmails.map(email => ({
@@ -415,7 +427,10 @@ router.get('/dashboard', async (req, res) => {
                 id: wh._id.toString(),
                 conversationId: wh.conversation_id,
                 callerPhone: getCallerPhoneFromWebhook(wh, 'Web Widget'),
-                callerName: resolveName(getCallerPhoneFromWebhook(wh, ''), wh.tour_booking_extracted?.name || 'Parent'),
+                callerName: resolveName(
+                    getCallerPhoneFromWebhook(wh, ''),
+                    getCallerNameFromWebhook(wh, null)
+                ),
                 duration: getCallDurationSeconds(wh),
                 timestamp: callTimestamp,
                 recordingUrl: `${backendUrl}/api/school/calls/${wh.conversation_id}/audio?token=${userToken}`,
@@ -431,7 +446,7 @@ router.get('/dashboard', async (req, res) => {
             id: cl._id.toString(),
             conversationId: cl.conversation_id,
             callerPhone: cl.from_phone_number || 'Unknown',
-            callerName: resolveName(cl.from_phone_number || '', cl.callerName || 'Parent'),
+            callerName: resolveName(cl.from_phone_number || '', cl.callerName),
             duration: cl.duration || 0,
             timestamp: cl.createdAt,
             recordingUrl: cl.conversation_id ? `${backendUrl}/api/school/calls/${cl.conversation_id}/audio?token=${userToken}` : null,
@@ -468,9 +483,14 @@ router.get('/dashboard', async (req, res) => {
             }
         });
 
-        const calls = Array.from(allCallsMap.values()).sort((a, b) =>
-            new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
-        );
+        const calls = Array.from(allCallsMap.values())
+            .map(c => ({
+                ...c,
+                callerName: resolveName(c.callerPhone, c.callerName),
+            }))
+            .sort((a, b) =>
+                new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+            );
 
         const schoolPlanDef = school?.subscriptionPlanKey
             ? getPlanDef(school.subscriptionPlanKey)
