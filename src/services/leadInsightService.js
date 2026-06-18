@@ -368,31 +368,16 @@ function getCallerSchoolQuestions(callerText) {
     return filterSchoolQuestions(chunks);
 }
 
-/** Tour interest must come from what the caller actually said — not AI summary. */
-const CALLER_TOUR_INQUIRY_PATTERNS = [
-    /\b(?:book|schedule|want|need|like|would like).{0,40}\b(?:school\s+)?tours?\b/i,
-    /\b(?:school\s+)?tours?\b.{0,40}(?:book|schedule|visit)/i,
-    /\bschedule a (?:school\s+)?visit\b/i,
-    /\bvisit the (?:school|campus)\b/i,
-    /\bi want to (?:book|schedule).{0,25}tour/i,
-];
-
-function callerAskedAboutTour(callerText) {
-    const lines = String(callerText || '')
-        .split(/\s*\|\s*|\n+/)
-        .map((line) => line.trim())
-        .filter((line) => line.length >= 5 && !/^\.+$/.test(line));
-    if (lines.length === 0) return false;
-    return lines.some((line) => CALLER_TOUR_INQUIRY_PATTERNS.some((pattern) => pattern.test(line)));
-}
-
-function hasSchoolKbInquiry({ callerText = '' } = {}) {
+function hasSchoolKbInquiry({
+    questionsAsked = [],
+    callerText = '',
+    comprehensiveResult = null,
+} = {}) {
+    if (filterSchoolQuestions(questionsAsked).length > 0) return true;
+    if (comprehensiveResult && mergeParentQuestionsFromExtraction(comprehensiveResult).length > 0) {
+        return true;
+    }
     return getCallerSchoolQuestions(callerText).length > 0;
-}
-
-function hasHotLeadInquiry({ callerText = '' } = {}) {
-    return hasSchoolKbInquiry({ callerText })
-        || callerAskedAboutTour(callerText);
 }
 
 function detectHotLead({
@@ -404,35 +389,37 @@ function detectHotLead({
     missingDetails = [],
     comprehensiveResult = null,
 } = {}) {
-    const summaryText = String(summary || '');
+    const summaryText = String(summary || '').toLowerCase();
+    const schoolInquiry = hasSchoolKbInquiry({ questionsAsked, callerText, comprehensiveResult });
 
-    if (isNoMeaningfulInteractionSummary(summaryText)) {
+    if (/no meaningful interaction|did not engage|call was interrupted|caller did not/i.test(summaryText)) {
         return false;
     }
-    if (/no meaningful interaction|did not engage|call was interrupted|caller did not/i.test(summaryText.toLowerCase())) {
-        return false;
-    }
-    if (
-        /ended before any additional information|before any .{0,40}(?:could be )?collected/i.test(summaryText.toLowerCase())
-        || /no questions (?:were )?asked/i.test(summaryText.toLowerCase())
-        || /call ended before/i.test(summaryText.toLowerCase())
-    ) {
-        return false;
-    }
-    if (isTransferBoilerplateSummary(summaryText) && parentSegment !== 'current_family') {
-        return false;
+
+    // Partial / early hang-ups with no school questions are not hot leads.
+    // Callers who asked about tuition, programs, meals, etc. still qualify even if
+    // the call ended before all contact details were collected (e.g. Arjun).
+    if (!schoolInquiry) {
+        if (
+            /ended before any additional information|before any .{0,40}(?:could be )?collected/i.test(summaryText)
+            || /no questions (?:were )?asked/i.test(summaryText)
+            || /call ended before/i.test(summaryText)
+        ) {
+            return false;
+        }
     }
 
     if (parentSegment === 'unknown') {
         return false;
     }
 
-    if (!hasHotLeadInquiry({ callerText })) {
+    if (!schoolInquiry) {
         return false;
     }
 
     if (parentSegment === 'current_family') {
-        return CURRENT_FAMILY_INQUIRY_PATTERNS.some((pattern) => pattern.test(String(callerText || '')));
+        const inquiryHaystack = `${callerText} ${filterSchoolQuestions(questionsAsked).join(' ')}`.trim();
+        return CURRENT_FAMILY_INQUIRY_PATTERNS.some((pattern) => pattern.test(inquiryHaystack));
     }
 
     return true;
@@ -742,12 +729,9 @@ function sanitizeCachedInsight(doc, webhook = null) {
 
     const questionsAsked = doc.questionsAsked || [];
     const missingDetails = doc.missingDetails || [];
-    const resolvedSummary = webhook
-        ? resolveWebhookSummary(webhook)
-        : String(doc.summary || '');
     const isHotLead = detectHotLead({
         tags,
-        summary: resolvedSummary,
+        summary: doc.summary || '',
         callerText: webhook ? getCallerText(webhook) : '',
         parentSegment,
         questionsAsked,
