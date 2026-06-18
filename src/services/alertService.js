@@ -77,6 +77,8 @@ async function createAlertInternal(payload) {
         return null;
     }
 
+    const effectiveSeverity = type === 'OUTLOOK_ERROR' ? 'CRITICAL' : severity;
+
     const mergedMetadata = {
         ...metadata,
         rawMessage: message,
@@ -112,7 +114,7 @@ async function createAlertInternal(payload) {
         existing.message = enrichedMessage;
         existing.metadata = mergeMetadata(existing.metadata, mergedMetadata);
         if (schoolName) existing.schoolName = schoolName;
-        if (severity === 'CRITICAL' && existing.severity !== 'CRITICAL') {
+        if (effectiveSeverity === 'CRITICAL' && existing.severity !== 'CRITICAL') {
             existing.severity = 'CRITICAL';
         }
         await existing.save();
@@ -120,7 +122,7 @@ async function createAlertInternal(payload) {
     } else {
         alert = await Alert.create({
             type,
-            severity,
+            severity: effectiveSeverity,
             status: 'ACTIVE',
             title,
             message: enrichedMessage,
@@ -137,7 +139,7 @@ async function createAlertInternal(payload) {
         });
     }
 
-    if (severity === 'CRITICAL') {
+    if (effectiveSeverity === 'CRITICAL') {
         try {
             await deliverCriticalEmailIfNeeded(alert);
         } catch (err) {

@@ -14,7 +14,7 @@ const { sendEmail } = require('../services/mailService');
 const { generateICS } = require('../utils/ics');
 const { parseLocalDateTimeToUTC } = require('../utils/timezone');
 const { deductCallMinutes } = require('../services/billingService');
-const { mapComprehensiveResult, upsertLeadInsight } = require('../services/leadInsightService');
+const { mapComprehensiveResult, upsertLeadInsight, resolveParentEmail, isTourBookedEmailMissing } = require('../services/leadInsightService');
 const jwt = require('jsonwebtoken');
 const JWT_SECRET = process.env.JWT_SECRET || 'childcare-enrollment-ai-secret-key-2024';
 
@@ -252,6 +252,9 @@ async function processTranscriptWithAI(webhookId, transcriptArray) {
 
         if (updatedWebhook?.schoolId && aiResult.comprehensive_result) {
             const insightData = mapComprehensiveResult(aiResult.comprehensive_result, updatedWebhook);
+            await ElevenLabsWebhook.findByIdAndUpdate(webhookId, {
+                extractedTags: insightData.tags || [],
+            });
             upsertLeadInsight({
                 schoolId: updatedWebhook.schoolId,
                 webhook: updatedWebhook,
@@ -443,6 +446,7 @@ async function createTourBookingFromWebhook(webhook, aiResult) {
 
         // Use AI results already extracted
         const extracted = aiResult.tour_booking_extracted || {};
+        const parentEmail = resolveParentEmail(webhook, aiResult.comprehensive_result) || '';
         console.log('[Webhook Booking] Using extracted info:', extracted);
 
         // Parent's phone is 'from_number' for inbound calls
@@ -479,7 +483,7 @@ async function createTourBookingFromWebhook(webhook, aiResult) {
                 schoolId,
                 parentName,
                 phone: phone || '',
-                email: extracted.email || '',
+                email: parentEmail,
                 childName: extracted.childName || '',
                 childAge: extracted.childAge || '',
                 reason: extracted.notes || '',
@@ -494,7 +498,7 @@ async function createTourBookingFromWebhook(webhook, aiResult) {
         // Get school name and preferred calendar for event title
         const school = await School.findById(schoolId).select('name preferredCalendar').lean();
         const title = `School Tour – ${parentName}`;
-        const description = `Tour for ${parentName}. Phone: ${phone || 'N/A'}. Email: ${extracted.email || 'N/A'}. Reason: ${extracted.notes || 'Inquiry'}.${extracted.notes ? ` Notes: ${extracted.notes}` : ''}`;
+        const description = `Tour for ${parentName}. Phone: ${phone || 'N/A'}. Email: ${parentEmail || 'N/A'}. Reason: ${extracted.notes || 'Inquiry'}.${extracted.notes ? ` Notes: ${extracted.notes}` : ''}`;
 
         console.log(`[Webhook Booking] School: ${school?.name || 'Unknown'}`);
         console.log(`[Webhook Booking] Preferred Calendar: ${school?.preferredCalendar || 'google'}`);
@@ -513,7 +517,6 @@ async function createTourBookingFromWebhook(webhook, aiResult) {
             integrations.map(i => `${i.type} (connected: ${i.connected})`).join(', ') || 'None');
 
         // Create calendar event (include parent email so they receive a calendar invite)
-        const parentEmail = extracted.email || '';
         console.log(`[Webhook Booking] Attempting to create calendar event with preference: ${school?.preferredCalendar || 'google'}...`);
         if (parentEmail) {
             console.log(`[Webhook Booking] Adding parent as attendee for calendar invite: ${parentEmail}`);
@@ -534,7 +537,7 @@ async function createTourBookingFromWebhook(webhook, aiResult) {
             schoolId,
             parentName,
             phone: phone || '',
-            email: extracted.email || '',
+            email: parentEmail,
             childName: extracted.childName || '',
             childAge: extracted.childAge || '',
             reason: extracted.reason || extracted.notes || '',
@@ -777,6 +780,8 @@ async function sendAdminEmailNotification(webhook, aiResult = null) {
         const tourBooked = webhook.tour_booking_detected || aiResult?.tour_booking_detected || false;
         const tourDate = webhook.tour_booking_date || aiResult?.tour_booking_date || null;
         const tourNotes = webhook.tour_booking_extracted?.notes || aiResult?.tour_booking_extracted?.notes || '';
+        const parentEmail = resolveParentEmail(webhook, aiResult?.comprehensive_result);
+        const tourEmailMissing = isTourBookedEmailMissing(webhook, aiResult?.comprehensive_result);
 
         const backendUrl = process.env.BACKEND_URL || 'http://localhost:5001';
         const notificationToken = jwt.sign(
@@ -785,7 +790,11 @@ async function sendAdminEmailNotification(webhook, aiResult = null) {
             { expiresIn: '7d' }
         );
 
-        const emailSubject = `New Call Received - ${school.name}${tourBooked ? ' (Tour Booked)' : ''}`;
+        const emailSubject = `New Call Received - ${school.name}${
+            tourBooked
+                ? (tourEmailMissing ? ' (Tour Booked - Email Missing)' : ' (Tour Booked)')
+                : ''
+        }`;
         let emailBody = `Hello,
 
 A new call has been received and processed for ${school.name}.
@@ -813,6 +822,11 @@ ${summary}
 - Tour Scheduled: ${tourDateStr}
 ${tourNotes ? `- Notes: ${tourNotes}\n` : ''}
 `;
+            if (tourEmailMissing) {
+                emailBody += `ATTENTION: Tour was booked but the parent's email was NOT captured. Please call the parent back to collect their email for calendar invite and follow-up.
+
+`;
+            }
         }
 
         emailBody += `You can view the full call details in your dashboard.

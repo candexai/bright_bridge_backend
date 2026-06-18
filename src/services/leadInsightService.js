@@ -1,23 +1,8 @@
 const crypto = require('crypto');
 const LeadInsight = require('../models/LeadInsight');
-const { extractTourDetails, mergeParentQuestionsFromExtraction } = require('../utils/openai');
+const { extractTourDetails, mergeParentQuestionsFromExtraction, filterSchoolQuestions } = require('../utils/openai');
 const { getCallerPhoneFromWebhook, getCallDurationSeconds, getCallerNameFromWebhook } = require('../utils/webhookHelpers');
-const { resolveWebhookSummary, resolveCachedSummary } = require('../utils/currentFamilyTransfer');
-
-const HOT_LEAD_AI_TAG_PATTERNS = [
-    /hot lead/i,
-    /parent requested callback/i,
-    /callback requested/i,
-    /enrollment inquiry/i,
-    /admission/i,
-    /urgent follow[- ]?up/i,
-    /follow[- ]?up needed/i,
-    /urgency:\s*immediate/i,
-    /urgency:\s*high/i,
-    /tour requested/i,
-    /price (concern|sensitive)/i,
-    /price inquiry/i,
-];
+const { resolveWebhookSummary, resolveCachedSummary, isNoMeaningfulInteractionSummary, isCurrentFamilyCall } = require('../utils/currentFamilyTransfer');
 
 /** New-parent enrollment / tour intent — word boundaries so "enrolled" does not match. */
 const NEW_PARENT_INTENT_PATTERNS = [
@@ -94,6 +79,266 @@ function safeStr(value) {
     return String(value || '');
 }
 
+const TOUR_BOOKED_TAG = 'Tour booked';
+const TOUR_BOOKED_EMAIL_MISSING_TAG = 'Tour booked - email missing';
+
+const TOUR_DETAILS_BY_PHONE_PATTERN = /(?:we(?:'|')?ll\s+)?make sure you have your tour details by phone|confirm your tour details by phone|tour details by phone/i;
+
+const EMAIL_SKIPPED_AGENT_PATTERNS = [
+    TOUR_DETAILS_BY_PHONE_PATTERN,
+    /email as not collected/i,
+    /skip(?:ped)? email/i,
+    /without (?:an? )?email/i,
+    /proceed without email/i,
+];
+
+const EMAIL_FLOW_PROMPT_PATTERN = /(?:email|e-mail|spell.*email|@gmail|@yahoo|@hotmail|@outlook|\.com)/i;
+const EMAIL_CONFIRM_PATTERN = /did i get that correct|is that correct|did i get it right|is that right/i;
+const EMAIL_RETRY_PATTERN = /spell your email.*again|email for me again/i;
+const EMAIL_SKIP_PATTERN = /no problem|without email|email as not collected|skip email|make sure you have your tour details by phone|tour details by phone/i;
+const USER_EMAIL_NO_PATTERN = /^(no|nope|nah|incorrect|wrong|that's wrong|that is wrong|not correct|that's not|that isn't)\.?$/i;
+const USER_EMAIL_YES_PATTERN = /^(yes|yeah|yep|yup|correct|that's right|that is right|that's correct)\.?$/i;
+
+function isValidConfirmedEmail(email) {
+    const t = String(email || '').trim();
+    if (!t) return false;
+    if (/^(not provided|n\/a|none|unknown)$/i.test(t)) return false;
+    return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/i.test(t);
+}
+
+function normalizeEmailForCompare(email) {
+    return String(email || '').trim().toLowerCase();
+}
+
+/** Collect the first valid email from webhook extraction, tour booking, or other sources. */
+function getValidEmailFromSources(webhook, comprehensiveResult = null, extraEmails = []) {
+    const resolved = comprehensiveResult ?? webhook?.comprehensive_result ?? null;
+    const candidates = [
+        resolved?.parent_email,
+        resolved?.one_pager?.header?.email,
+        webhook?.tour_booking_extracted?.email,
+        ...(Array.isArray(extraEmails) ? extraEmails : [extraEmails]),
+    ];
+    for (const email of candidates) {
+        if (isValidConfirmedEmail(email)) return String(email).trim();
+    }
+    return '';
+}
+
+function isAgentRole(role) {
+    const r = String(role || '').toLowerCase();
+    return r === 'agent' || r === 'assistant' || r === 'mia' || r === 'nora' || r.includes('assistant');
+}
+
+function isCallerRole(role) {
+    const r = String(role || '').toLowerCase();
+    return r === 'user' || r === 'parent' || r === 'caller' || r === 'customer' || r === 'human' || r.includes('caller');
+}
+
+/** Nora confirmed tour by phone instead of email — mandatory email-missing when tour is booked. */
+function agentConfirmedTourDetailsByPhone(webhook, comprehensiveResult = null) {
+    const resolved = comprehensiveResult ?? webhook?.comprehensive_result ?? null;
+    if (!isTourBooked(webhook, resolved)) return false;
+
+    const summary = String(resolved?.summary || webhook?.summary || '');
+    if (TOUR_DETAILS_BY_PHONE_PATTERN.test(summary)) return true;
+
+    const agentText = getAgentText(webhook);
+    if (TOUR_DETAILS_BY_PHONE_PATTERN.test(agentText)) return true;
+
+    if (Array.isArray(webhook?.transcript)) {
+        for (const raw of webhook.transcript) {
+            if (!isAgentRole(raw.role)) continue;
+            const text = String(raw.message || raw.text || '').trim();
+            if (text && TOUR_DETAILS_BY_PHONE_PATTERN.test(text)) return true;
+        }
+    }
+
+    return false;
+}
+
+function wasEmailSkippedOrRejectedInTranscript(webhook, comprehensiveResult = null, options = {}) {
+    const resolved = comprehensiveResult ?? webhook?.comprehensive_result ?? null;
+
+    if (agentConfirmedTourDetailsByPhone(webhook, resolved)) {
+        return true;
+    }
+
+    const summary = String(resolved?.summary || webhook?.summary || '').trim();
+
+    if (TOUR_DETAILS_BY_PHONE_PATTERN.test(summary)) {
+        return true;
+    }
+    if (
+        /email.{0,40}(?:not collected|not captured|not confirmed|skipped|could not confirm|without email)/i.test(summary)
+        || /(?:skipped|without).{0,20}email/i.test(summary)
+    ) {
+        return true;
+    }
+
+    const missingDetails = Array.isArray(resolved?.missing_details) ? resolved.missing_details : [];
+    if (
+        missingDetails.some((item) => /parent email|email address/i.test(String(item)))
+        && isTourBooked(webhook, resolved)
+    ) {
+        return true;
+    }
+
+    const onePagerEmail = safeStr(resolved?.one_pager?.header?.email);
+    if (/not provided/i.test(onePagerEmail) && isTourBooked(webhook, resolved)) {
+        return true;
+    }
+
+    const rawEmail = safeStr(resolved?.parent_email) || safeStr(webhook?.tour_booking_extracted?.email);
+    if (isTourBooked(webhook, resolved) && rawEmail.trim() && !isValidConfirmedEmail(rawEmail)) {
+        return true;
+    }
+
+    if (!Array.isArray(webhook?.transcript) || webhook.transcript.length === 0) {
+        return false;
+    }
+
+    const agentText = getAgentText(webhook);
+    if (EMAIL_SKIPPED_AGENT_PATTERNS.some((pattern) => pattern.test(agentText))) {
+        return true;
+    }
+
+    let inEmailFlow = false;
+    let awaitingConfirm = false;
+    let rejections = 0;
+    let emailConfirmedInCall = false;
+
+    for (const raw of webhook.transcript) {
+        const role = String(raw.role || '').toLowerCase();
+        const text = String(raw.message || raw.text || '').trim();
+        if (!text) continue;
+
+        const isAgent = isAgentRole(role);
+        const isUser = isCallerRole(role);
+
+        if (isAgent) {
+            if (inEmailFlow && EMAIL_SKIP_PATTERN.test(text) && rejections >= 1) {
+                return true;
+            }
+            if (EMAIL_FLOW_PROMPT_PATTERN.test(text)) {
+                inEmailFlow = true;
+            }
+            if (inEmailFlow && EMAIL_CONFIRM_PATTERN.test(text)) {
+                awaitingConfirm = true;
+            }
+            if (inEmailFlow && EMAIL_RETRY_PATTERN.test(text)) {
+                awaitingConfirm = false;
+            }
+            if (inEmailFlow && /what is your child'?s name/i.test(text) && rejections >= 2) {
+                return true;
+            }
+            if (
+                inEmailFlow
+                && /what is your child'?s name/i.test(text)
+                && rejections >= 1
+                && !/we(?:'|')?ll send your tour details to your email/i.test(agentText)
+            ) {
+                return true;
+            }
+        }
+
+        if (isUser && awaitingConfirm) {
+            const lower = text.toLowerCase();
+            if (USER_EMAIL_NO_PATTERN.test(lower) || /\b(no|nope|wrong|incorrect)\b/i.test(lower)) {
+                rejections += 1;
+                awaitingConfirm = false;
+                if (rejections >= 2) return true;
+            } else if (USER_EMAIL_YES_PATTERN.test(lower)) {
+                emailConfirmedInCall = true;
+                inEmailFlow = false;
+                awaitingConfirm = false;
+                rejections = 0;
+            }
+        }
+    }
+
+    if (emailConfirmedInCall) return false;
+    return rejections >= 2;
+}
+
+function resolveParentEmail(webhook, comprehensiveResult = null, options = {}) {
+    const extraEmails = options.extraEmails || [];
+    const fromSources = getValidEmailFromSources(webhook, comprehensiveResult, extraEmails);
+    if (fromSources) return fromSources;
+    if (wasEmailSkippedOrRejectedInTranscript(webhook, comprehensiveResult, options)) {
+        return '';
+    }
+    return '';
+}
+
+function isTourBooked(webhook, comprehensiveResult = null) {
+    if (comprehensiveResult?.tour_booked === true) return true;
+    return webhook?.tour_booking_detected === true;
+}
+
+function getStoredEmailNorms(webhook, comprehensiveResult = null) {
+    const resolved = comprehensiveResult ?? webhook?.comprehensive_result ?? null;
+    return [
+        resolved?.parent_email,
+        webhook?.tour_booking_extracted?.email,
+    ]
+        .map((email) => normalizeEmailForCompare(email))
+        .filter(Boolean);
+}
+
+function isTourBookedEmailMissing(webhook, comprehensiveResult = null, options = {}) {
+    const resolved = comprehensiveResult ?? webhook?.comprehensive_result ?? null;
+    if (!isTourBooked(webhook, resolved)) return false;
+
+    // Hard rule: Nora said tour details will be confirmed by phone → email was not collected.
+    if (agentConfirmedTourDetailsByPhone(webhook, resolved)) {
+        return true;
+    }
+
+    const skipped = wasEmailSkippedOrRejectedInTranscript(webhook, resolved, options);
+    const validTourEmail = (options.extraEmails || [])
+        .map((email) => String(email || '').trim())
+        .find(isValidConfirmedEmail);
+
+    if (skipped) {
+        const tourNorm = validTourEmail ? normalizeEmailForCompare(validTourEmail) : '';
+        const storedNorms = getStoredEmailNorms(webhook, resolved);
+        // Tour record copied the same AI-hallucinated email from this failed call — still missing.
+        if (tourNorm && storedNorms.includes(tourNorm)) return true;
+        // Tour record has a different valid email than this call's failed extraction.
+        if (tourNorm) return false;
+        return true;
+    }
+
+    if (getValidEmailFromSources(webhook, resolved, options.extraEmails || [])) return false;
+    return true;
+}
+
+function ensureTourBookedEmailMissingTag(tags, { tourBooked, parentEmail, emailMissing } = {}) {
+    const next = dedupeTags(Array.isArray(tags) ? tags : []);
+    if (!tourBooked) return next;
+
+    const hasTourBookedOnly = next.some((tag) => {
+        const lower = String(tag).toLowerCase();
+        return lower === 'tour booked' || (lower.includes('tour booked') && !lower.includes('email'));
+    });
+    if (!hasTourBookedOnly) {
+        next.unshift(TOUR_BOOKED_TAG);
+    }
+
+    const missing = emailMissing !== undefined
+        ? emailMissing
+        : !String(parentEmail || '').trim();
+    if (missing) {
+        if (!next.some((tag) => tag.toLowerCase().includes('email missing'))) {
+            next.push(TOUR_BOOKED_EMAIL_MISSING_TAG);
+        }
+    } else {
+        return dedupeTags(next.filter((tag) => !String(tag).toLowerCase().includes('email missing')));
+    }
+    return dedupeTags(next);
+}
+
 function dedupeTags(tags) {
     const seen = new Set();
     const out = [];
@@ -112,6 +357,29 @@ function isTransferBoilerplateSummary(summary) {
     return /current enrolled family member|transferred to the front desk|familia actual/i.test(String(summary || ''));
 }
 
+function getCallerSchoolQuestions(callerText) {
+    const caller = String(callerText || '').trim();
+    if (!caller) return [];
+    const chunks = caller
+        .split(/\s*\|\s*|\n+/)
+        .flatMap((line) => line.split(/(?<=[.!?])\s+/))
+        .map((s) => s.trim())
+        .filter((s) => s.length > 8);
+    return filterSchoolQuestions(chunks);
+}
+
+function hasSchoolKbInquiry({
+    questionsAsked = [],
+    callerText = '',
+    comprehensiveResult = null,
+} = {}) {
+    if (filterSchoolQuestions(questionsAsked).length > 0) return true;
+    if (comprehensiveResult && mergeParentQuestionsFromExtraction(comprehensiveResult).length > 0) {
+        return true;
+    }
+    return getCallerSchoolQuestions(callerText).length > 0;
+}
+
 function detectHotLead({
     tags = [],
     summary = '',
@@ -119,44 +387,36 @@ function detectHotLead({
     parentSegment = 'new_parent',
     questionsAsked = [],
     missingDetails = [],
+    comprehensiveResult = null,
 } = {}) {
-    const tagHaystack = (Array.isArray(tags) ? tags : []).join(' ').toLowerCase();
     const summaryText = String(summary || '').toLowerCase();
 
     if (/no meaningful interaction|did not engage|call was interrupted|caller did not/i.test(summaryText)) {
         return false;
     }
-
-    const questionsHaystack = (Array.isArray(questionsAsked) ? questionsAsked : []).join(' ').toLowerCase();
-    const callerHaystack = String(callerText || '').toLowerCase();
-    const inquiryHaystack = `${callerHaystack} ${questionsHaystack}`.trim();
-
-    if (parentSegment === 'current_family') {
-        if (!inquiryHaystack) return false;
-        return CURRENT_FAMILY_INQUIRY_PATTERNS.some((pattern) => pattern.test(inquiryHaystack));
-    }
-
-    const hasNoChildInfo = tagHaystack.includes('no child info')
-        || (Array.isArray(missingDetails) && missingDetails.some((m) => /child name|child age/i.test(String(m))));
-    const isPartial = tagHaystack.includes('partial call');
-    const hasIntent = NEW_PARENT_INTENT_PATTERNS.some((pattern) => pattern.test(inquiryHaystack));
-    const hasRealQuestions = questionsAsked.length > 0
-        && inquiryHaystack.replace(/\b(current family|familia actual)\b/gi, '').trim().length > 15;
-
-    if (isPartial && hasNoChildInfo && !hasIntent && !hasRealQuestions) {
+    if (
+        /ended before any additional information|before any .{0,40}(?:could be )?collected/i.test(summaryText)
+        || /no questions (?:were )?asked/i.test(summaryText)
+        || /call ended before/i.test(summaryText)
+    ) {
         return false;
     }
 
-    if (HOT_LEAD_AI_TAG_PATTERNS.some((pattern) => pattern.test(tagHaystack))) {
-        return true;
+    if (parentSegment === 'unknown') {
+        return false;
     }
 
-    if (!isTransferBoilerplateSummary(summaryText)
-        && NEW_PARENT_INTENT_PATTERNS.some((pattern) => pattern.test(summaryText))) {
-        return true;
+    const schoolInquiry = hasSchoolKbInquiry({ questionsAsked, callerText, comprehensiveResult });
+    if (!schoolInquiry) {
+        return false;
     }
 
-    return hasIntent || hasRealQuestions;
+    if (parentSegment === 'current_family') {
+        const inquiryHaystack = `${callerText} ${filterSchoolQuestions(questionsAsked).join(' ')}`.trim();
+        return CURRENT_FAMILY_INQUIRY_PATTERNS.some((pattern) => pattern.test(inquiryHaystack));
+    }
+
+    return true;
 }
 
 function callerIdentifiedAsCurrentFamily(callerText) {
@@ -192,39 +452,118 @@ function agentTriggeredCurrentFamilyTransfer(agentText) {
     return AGENT_CURRENT_FAMILY_TRANSFER_PATTERNS.some((pattern) => pattern.test(agentHaystack));
 }
 
-function detectParentSegment(tags, summary, webhookOrCallerText) {
+function hasSchoolRelatedIntent({
+    summary = '',
+    callerText = '',
+    questionsAsked = [],
+    comprehensiveResult = null,
+    tags = [],
+} = {}) {
+    const topics = Array.isArray(comprehensiveResult?.topics_of_interest)
+        ? comprehensiveResult.topics_of_interest.join(' ')
+        : '';
+    const inquiryHaystack = `${callerText} ${(questionsAsked || []).join(' ')} ${topics}`.toLowerCase();
+    const summaryText = String(summary || '').toLowerCase();
+    const tagHaystack = (Array.isArray(tags) ? tags : []).join(' ').toLowerCase();
+
+    if (/tour requested|hot lead|urgency:/i.test(tagHaystack)) return true;
+    if (NEW_PARENT_INTENT_PATTERNS.some((pattern) => pattern.test(inquiryHaystack))) return true;
+    if (NEW_PARENT_INTENT_PATTERNS.some((pattern) => pattern.test(summaryText))) return true;
+
+    const realQuestions = (questionsAsked || []).filter((q) => String(q || '').trim().length > 8);
+    if (realQuestions.length > 0) {
+        const qHaystack = realQuestions.join(' ').toLowerCase();
+        if (NEW_PARENT_INTENT_PATTERNS.some((pattern) => pattern.test(qHaystack))) return true;
+    }
+
+    return false;
+}
+
+function hasCapturedEnrollmentData({ childName = '', childAge = '', comprehensiveResult = null } = {}) {
+    if (String(childName || '').trim() || String(childAge || '').trim()) return true;
+    const parentName = comprehensiveResult?.parent_name;
+    const parentEmail = comprehensiveResult?.parent_email;
+    const parentPhone = comprehensiveResult?.parent_phone;
+    if (parentName && String(parentName).trim() && !/^parent$/i.test(String(parentName).trim())) return true;
+    if (parentEmail && String(parentEmail).trim()) return true;
+    if (parentPhone && String(parentPhone).trim()) return true;
+    return false;
+}
+
+function isUnknownCall({
+    tags = [],
+    summary = '',
+    callerText = '',
+    questionsAsked = [],
+    comprehensiveResult = null,
+    childName = '',
+    childAge = '',
+    tourBooked = false,
+} = {}) {
+    if (tourBooked) return false;
+    if (comprehensiveResult?.call_state === 'no_interaction') return true;
+
+    const summaryText = String(summary || '');
+    if (isNoMeaningfulInteractionSummary(summaryText)) return true;
+    if (/primarily greetings|misdial|silence|background noise|only greetings/i.test(summaryText.toLowerCase())) {
+        return true;
+    }
+
+    const params = {
+        tags,
+        summary: summaryText,
+        callerText,
+        questionsAsked,
+        comprehensiveResult,
+        childName,
+        childAge,
+        tourBooked,
+    };
+
+    if (hasSchoolRelatedIntent(params)) return false;
+    if (hasCapturedEnrollmentData(params)) return false;
+
+    return true;
+}
+
+function detectParentSegment(tags, summary, webhookOrCallerText, options = {}) {
     const webhook = typeof webhookOrCallerText === 'object' && webhookOrCallerText !== null
         ? webhookOrCallerText
         : null;
     const callerText = webhook ? getCallerText(webhook) : String(webhookOrCallerText || '');
     const agentText = webhook ? getAgentText(webhook) : '';
 
-    const tagHaystack = (Array.isArray(tags) ? tags : []).join(' ').toLowerCase();
-    if (/current family|existing family|already enrolled|current parent/i.test(tagHaystack)) {
+    // Current family requires transcript proof — never trust AI tags/summary alone.
+    if (webhook?.transcript && isCurrentFamilyCall(webhook.transcript)) {
         return 'current_family';
     }
-
-    if (agentTriggeredCurrentFamilyTransfer(agentText)) {
-        return 'current_family';
-    }
-
-    const summaryText = String(summary || '').toLowerCase();
-    if (
-        /identified (?:herself|himself|themselves)?(?: as)?(?: a)? current family/i.test(summaryText)
-        || /\bas a current family\b/i.test(summaryText)
-        || /\bexisting family\b/i.test(summaryText)
-        || /\balready enrolled\b/i.test(summaryText)
-        || /\bcurrent parent\b/i.test(summaryText)
-        || /\bcurrent enrolled family\b/i.test(summaryText)
-        || /\bcurrent family\b/i.test(summaryText)
-        || /connect(?:ed)? (?:them |(?:the )?caller )?to the front desk/i.test(summaryText)
-        || /requested (?:to speak with |)the front desk/i.test(summaryText)
-    ) {
-        return 'current_family';
-    }
-
     if (callerIdentifiedAsCurrentFamily(callerText)) {
         return 'current_family';
+    }
+    if (callerIdentifiedAsCurrentFamily(callerText) && agentTriggeredCurrentFamilyTransfer(agentText)) {
+        return 'current_family';
+    }
+
+    const comprehensiveResult = options.comprehensiveResult
+        ?? (typeof webhookOrCallerText === 'object' ? webhookOrCallerText?.comprehensive_result : null)
+        ?? null;
+    const questionsAsked = options.questionsAsked || [];
+    const childName = options.childName || '';
+    const childAge = options.childAge || '';
+    const tourBooked = options.tourBooked
+        ?? (webhook ? isTourBooked(webhook, comprehensiveResult) : false);
+
+    if (isUnknownCall({
+        tags,
+        summary: summary || (webhook ? resolveWebhookSummary(webhook) : ''),
+        callerText,
+        questionsAsked,
+        comprehensiveResult,
+        childName,
+        childAge,
+        tourBooked,
+    })) {
+        return 'unknown';
     }
 
     return 'new_parent';
@@ -241,8 +580,15 @@ function enrichTags(tags, isHotLead, parentSegment) {
 
     if (parentSegment === 'current_family' && !hasTag('Current Family')) {
         next.push('Current Family');
+    } else if (parentSegment === 'unknown' && !hasTag('Unknown')) {
+        next.push('Unknown');
     } else if (parentSegment === 'new_parent' && !hasTag('New Parent')) {
         next.push('New Parent');
+    }
+
+    if (parentSegment === 'unknown') {
+        next = next.filter((tag) => tag.toLowerCase() !== 'new parent');
+        next = next.filter((tag) => tag.toLowerCase() !== 'current family');
     }
 
     return dedupeTags(next);
@@ -272,6 +618,12 @@ function applyTagPostProcessing(comprehensiveData) {
         }
     }
 
+    data.tags = ensureTourBookedEmailMissingTag(data.tags, {
+        tourBooked: data.tourBooked,
+        parentEmail: data.parentEmail,
+        emailMissing: data.emailMissing,
+    });
+
     data.tags = dedupeTags(data.tags);
     if (!data.isHotLead) {
         data.tags = data.tags.filter((tag) => tag.toLowerCase() !== 'hot lead');
@@ -283,13 +635,30 @@ function applyTagPostProcessing(comprehensiveData) {
 function mapInsightFields(webhook, { tags = [], comprehensiveResult = null, summaryText = '' } = {}) {
     const callerText = getCallerText(webhook);
     const resolvedSummary = summaryText || comprehensiveResult?.summary || resolveWebhookSummary(webhook);
-    const parentSegment = detectParentSegment(tags, resolvedSummary, webhook);
     const questionsAsked = mergeParentQuestionsFromExtraction(comprehensiveResult, {
         summaryText: resolvedSummary,
     });
     const missingDetails = Array.isArray(comprehensiveResult?.missing_details)
         ? comprehensiveResult.missing_details
         : (Array.isArray(webhook?.extractedMissingDetails) ? webhook.extractedMissingDetails : []);
+    const tourBooked = isTourBooked(webhook, comprehensiveResult);
+    const parentEmail = resolveParentEmail(webhook, comprehensiveResult);
+    const emailMissing = isTourBookedEmailMissing(webhook, comprehensiveResult);
+    const childName = safeStr(comprehensiveResult?.child_name)
+        || webhook?.extractedChildName
+        || webhook?.tour_booking_extracted?.childName
+        || '';
+    const childAge = safeStr(comprehensiveResult?.child_age)
+        || webhook?.extractedChildAge
+        || webhook?.tour_booking_extracted?.childAge
+        || '';
+    const parentSegment = detectParentSegment(tags, resolvedSummary, webhook, {
+        comprehensiveResult,
+        questionsAsked,
+        childName,
+        childAge,
+        tourBooked,
+    });
 
     const isHotLead = detectHotLead({
         tags,
@@ -298,23 +667,21 @@ function mapInsightFields(webhook, { tags = [], comprehensiveResult = null, summ
         parentSegment,
         questionsAsked,
         missingDetails,
+        comprehensiveResult,
     });
 
     return applyTagPostProcessing({
         tags: enrichTags(tags, isHotLead, parentSegment),
-        childName: safeStr(comprehensiveResult?.child_name)
-            || webhook?.extractedChildName
-            || webhook?.tour_booking_extracted?.childName
-            || '',
-        childAge: safeStr(comprehensiveResult?.child_age)
-            || webhook?.extractedChildAge
-            || webhook?.tour_booking_extracted?.childAge
-            || '',
+        childName,
+        childAge,
         language: comprehensiveResult?.language_spoken || webhook?.extractedLanguage || '',
         missingDetails,
         questionsAsked,
         isHotLead,
         parentSegment,
+        tourBooked,
+        parentEmail,
+        emailMissing,
     });
 }
 
@@ -342,18 +709,28 @@ function mapSummaryFallback(webhook) {
     });
 }
 
-function sanitizeCachedInsight(doc) {
-    const parentSegment = doc.parentSegment || 'new_parent';
-    const tags = doc.tags || [];
+function sanitizeCachedInsight(doc, webhook = null) {
+    let parentSegment = doc.parentSegment || 'new_parent';
+    let tags = doc.tags || [];
+
+    if (webhook) {
+        const fresh = webhook.comprehensive_result
+            ? mapComprehensiveResult(webhook.comprehensive_result, webhook)
+            : mapSummaryFallback(webhook);
+        parentSegment = fresh.parentSegment || parentSegment;
+        tags = fresh.tags || tags;
+    }
+
     const questionsAsked = doc.questionsAsked || [];
     const missingDetails = doc.missingDetails || [];
     const isHotLead = detectHotLead({
         tags,
         summary: doc.summary || '',
-        callerText: '',
+        callerText: webhook ? getCallerText(webhook) : '',
         parentSegment,
         questionsAsked,
         missingDetails,
+        comprehensiveResult: webhook?.comprehensive_result || null,
     });
     return {
         tags: enrichTags(tags.filter((t) => t.toLowerCase() !== 'hot lead'), isHotLead, parentSegment),
@@ -362,9 +739,9 @@ function sanitizeCachedInsight(doc) {
     };
 }
 
-function mapLeadInsightDoc(doc) {
+function mapLeadInsightDoc(doc, webhook = null) {
     if (!doc) return null;
-    const sanitized = sanitizeCachedInsight(doc);
+    const sanitized = sanitizeCachedInsight(doc, webhook);
     return {
         tags: sanitized.tags,
         childName: doc.childName || '',
@@ -378,7 +755,9 @@ function mapLeadInsightDoc(doc) {
     };
 }
 
-function buildInsightSnapshot(webhook) {
+function buildInsightSnapshot(webhook, insightData = {}) {
+    const emailMissingForTour = isTourBookedEmailMissing(webhook);
+    const parentSegment = insightData.parentSegment || 'new_parent';
     return {
         callerName: getCallerNameFromWebhook(webhook),
         callerPhone: getCallerPhoneFromWebhook(webhook, 'Unknown'),
@@ -387,14 +766,16 @@ function buildInsightSnapshot(webhook) {
             ? new Date(webhook.metadata.start_time_unix_secs * 1000)
             : (webhook.received_at || new Date()),
         durationSeconds: getCallDurationSeconds(webhook),
-        actionNeededEligible: !webhook.tour_booking_detected && !webhook.actionTaken,
+        actionNeededEligible: emailMissingForTour
+            ? !webhook.actionTaken
+            : (!webhook.tour_booking_detected && !webhook.actionTaken),
         actionTakenFeedback: webhook.actionTakenFeedback || '',
         actionTakenAt: webhook.actionTakenAt || null,
     };
 }
 
 function buildLeadInsightPersistPayload(schoolId, webhook, insightData, transcriptHash) {
-    const snapshot = buildInsightSnapshot(webhook);
+    const snapshot = buildInsightSnapshot(webhook, insightData);
     return {
         schoolId,
         webhookId: webhook._id,
@@ -457,6 +838,7 @@ async function buildInsightDataForWebhook(webhook, { allowOpenAI = false } = {})
                 parentSegment,
                 questionsAsked,
                 missingDetails: extracted.missingDetails || [],
+                comprehensiveResult: extracted,
             });
             const data = applyTagPostProcessing({
                 ...extracted,
@@ -496,7 +878,7 @@ async function resolveInsightsForWebhooks(webhooks, schoolId, options = {}) {
         const cached = insightMap.get(key);
 
         if (cached) {
-            resolved.set(key, mapLeadInsightDoc(cached));
+            resolved.set(key, mapLeadInsightDoc(cached, webhook));
             continue;
         }
 
@@ -539,7 +921,14 @@ async function resolveInsightsForWebhooks(webhooks, schoolId, options = {}) {
 
 function buildActionNeededCallFromInsight(row, backendUrl, userToken, webhook = null) {
     const conversationId = row.conversationId || '';
-    const sanitized = sanitizeCachedInsight(row);
+    const sanitized = sanitizeCachedInsight(row, webhook);
+    const tags = webhook
+        ? ensureTourBookedEmailMissingTag(sanitized.tags, {
+            tourBooked: isTourBooked(webhook),
+            parentEmail: resolveParentEmail(webhook),
+            emailMissing: isTourBookedEmailMissing(webhook),
+        })
+        : sanitized.tags;
     const summary = resolveCachedSummary(row, webhook);
     return {
         id: String(row.webhookId),
@@ -555,11 +944,11 @@ function buildActionNeededCallFromInsight(row, backendUrl, userToken, webhook = 
             : null,
         duration: row.durationSeconds || 0,
         questionsAsked: row.questionsAsked || [],
-        actionTaken: row.actionNeededEligible === false,
+        actionTaken: Boolean(webhook?.actionTaken),
         actionTakenAt: row.actionTakenAt || null,
         actionTakenFeedback: row.actionTakenFeedback || '',
         feedbackHistory: undefined,
-        tags: sanitized.tags,
+        tags,
         childName: row.childName || '',
         childAge: row.childAge || '',
         language: row.language || '',
@@ -582,8 +971,11 @@ async function loadActionNeededCalls(schoolObjectId, backendUrl, userToken, opti
 
     const cachedRows = await LeadInsight.find({
         schoolId: schoolObjectId,
-        actionNeededEligible: true,
         callTimestamp: { $gte: since },
+        $or: [
+            { actionNeededEligible: true },
+            { parentSegment: 'unknown' },
+        ],
     })
         .select(listProjection)
         .sort({ callTimestamp: -1 })
@@ -592,39 +984,47 @@ async function loadActionNeededCalls(schoolObjectId, backendUrl, userToken, opti
     if (cachedRows.length > 0) {
         const webhookIds = cachedRows.map((row) => row.webhookId).filter(Boolean);
         const webhooks = await ElevenLabsWebhook.find({ _id: { $in: webhookIds } })
-            .select('_id conversation_id summary transcript comprehensive_result tour_booking_extracted metadata received_at user_id')
+            .select('_id conversation_id summary transcript comprehensive_result tour_booking_extracted metadata received_at user_id actionTaken actionTakenFeedback actionTakenAt')
             .lean();
         const webhookMap = new Map(webhooks.map((wh) => [String(wh._id), wh]));
 
-        return cachedRows.map((row) =>
-            buildActionNeededCallFromInsight(
-                row,
-                backendUrl,
-                userToken,
-                webhookMap.get(String(row.webhookId)) || null
+        return cachedRows
+            .map((row) =>
+                buildActionNeededCallFromInsight(
+                    row,
+                    backendUrl,
+                    userToken,
+                    webhookMap.get(String(row.webhookId)) || null
+                )
             )
-        );
+            .filter((call) => !call.actionTaken);
     }
 
     const webhooks = await ElevenLabsWebhook.find({
         type: 'post_call_transcription',
         received_at: { $gte: since },
-        tour_booking_detected: { $ne: true },
         actionTaken: { $ne: true },
         schoolId: schoolObjectId,
     })
-        .select('_id conversation_id received_at metadata summary tour_booking_extracted comprehensive_result user_id actionTakenFeedback actionTakenAt feedbackHistory')
+        .select('_id conversation_id received_at metadata summary tour_booking_detected tour_booking_extracted comprehensive_result user_id actionTakenFeedback actionTakenAt feedbackHistory')
         .sort({ received_at: -1 })
         .lean();
 
-    const insightMap = await resolveInsightsForWebhooks(webhooks, schoolObjectId, {
+    const eligibleWebhooks = webhooks.filter((wh) => {
+        if (!wh.tour_booking_detected) return true;
+        return isTourBookedEmailMissing(wh);
+    });
+
+    const insightMap = await resolveInsightsForWebhooks(eligibleWebhooks, schoolObjectId, {
         allowOpenAI: false,
         persist: false,
     });
 
-    return webhooks.map((wh) =>
-        buildActionNeededCall(wh, insightMap.get(String(wh._id)), backendUrl, userToken)
-    );
+    return eligibleWebhooks
+        .map((wh) =>
+            buildActionNeededCall(wh, insightMap.get(String(wh._id)), backendUrl, userToken)
+        )
+        .filter((call) => !call.actionTaken);
 }
 
 async function markLeadInsightActionTaken(webhookId, feedback = '') {
@@ -677,11 +1077,22 @@ function buildActionNeededCall(webhook, insight, backendUrl, userToken) {
 }
 
 module.exports = {
+    TOUR_BOOKED_TAG,
+    TOUR_BOOKED_EMAIL_MISSING_TAG,
     hashTranscript,
     getTranscriptText,
     detectHotLead,
     detectParentSegment,
     enrichTags,
+    resolveParentEmail,
+    isTourBooked,
+    isTourBookedEmailMissing,
+    wasEmailSkippedOrRejectedInTranscript,
+    isValidConfirmedEmail,
+    getValidEmailFromSources,
+    ensureTourBookedEmailMissingTag,
+    isUnknownCall,
+    hasSchoolRelatedIntent,
     mapComprehensiveResult,
     mapWebhookExtractedFields,
     mapSummaryFallback,

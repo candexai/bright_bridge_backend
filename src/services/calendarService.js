@@ -209,7 +209,7 @@ async function getOutlookBusySlots(integration, start, end) {
                 integration,
                 'Outlook calendar sync failed',
                 msg,
-                'WARNING',
+                'CRITICAL',
                 { source: 'calendarService.getOutlookBusySlots' }
             );
         }
@@ -536,7 +536,7 @@ async function createOutlookCalendarEvent(integration, { title, start, end, desc
             integration,
             'Failed to create Outlook calendar event',
             msg || 'Failed to create Outlook event',
-            status === 401 || status === 403 ? 'CRITICAL' : 'WARNING',
+            'CRITICAL',
             { source: 'calendarService.createOutlookCalendarEvent' }
         );
         return { success: false, error: msg || 'Failed to create Outlook event' };

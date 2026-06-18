@@ -23,6 +23,8 @@ const {
     getCallerPhoneFromWebhook,
     getCallerNameFromWebhook,
     isUsableCallerName,
+    isWidgetCallerId,
+    isRealPhoneForLookup,
 } = require('../utils/webhookHelpers');
 const { resolveWebhookSummary } = require('../utils/currentFamilyTransfer');
 const {
@@ -31,6 +33,13 @@ const {
     loadActionNeededCalls,
     markLeadInsightActionTaken,
     removeLeadInsightForWebhook,
+    ensureTourBookedEmailMissingTag,
+    resolveParentEmail,
+    mapSummaryFallback,
+    mapComprehensiveResult,
+    isTourBooked,
+    isTourBookedEmailMissing,
+    isValidConfirmedEmail,
 } = require('../services/leadInsightService');
 const {
     formatQAPairsForKB,
@@ -42,7 +51,9 @@ const { getPlanDef } = require('../config/billingPlans');
 const {
     generateWordCloud,
     mergeParentQuestionsFromExtraction,
-    mergeQuestionLists
+    mergeQuestionLists,
+    filterSchoolQuestions,
+    extractTourTalkingPoints,
 } = require('../utils/openai');
 
 
@@ -55,6 +66,42 @@ router.use(authMiddleware, schoolOnly);
 
 /** Exclude large blobs — transcripts alone can be 8MB+ for 265 calls. */
 const WEBHOOK_LIST_PROJECTION = '-raw_payload -audio_base64 -transcript';
+
+/** Required for HTML5 audio seeking — browsers request byte ranges when scrubbing. */
+function sendAudioBufferWithRange(req, res, audioBuffer) {
+    const total = audioBuffer.length;
+    res.set('Accept-Ranges', 'bytes');
+    res.set('Content-Type', 'audio/mpeg');
+    res.set('Cache-Control', 'private, max-age=3600');
+
+    const range = req.headers.range;
+    if (!range) {
+        res.set('Content-Length', String(total));
+        return res.send(audioBuffer);
+    }
+
+    const match = /^bytes=(\d*)-(\d*)$/.exec(range);
+    if (!match) {
+        res.set('Content-Length', String(total));
+        return res.send(audioBuffer);
+    }
+
+    let start = match[1] ? parseInt(match[1], 10) : 0;
+    let end = match[2] ? parseInt(match[2], 10) : total - 1;
+    if (Number.isNaN(start)) start = 0;
+    if (Number.isNaN(end) || end >= total) end = total - 1;
+
+    if (start > end || start >= total) {
+        res.status(416).set('Content-Range', `bytes */${total}`);
+        return res.end();
+    }
+
+    const chunk = audioBuffer.subarray(start, end + 1);
+    res.status(206);
+    res.set('Content-Range', `bytes ${start}-${end}/${total}`);
+    res.set('Content-Length', String(chunk.length));
+    return res.send(chunk);
+}
 
 // Helper function to format Q&A pairs is now imported from elevenlabs utility
 
@@ -199,7 +246,9 @@ router.get('/dashboard', async (req, res) => {
             const byPhone = new Map();
             for (const wh of webhooks) {
                 if (wh.conversation_id) byConversationId.set(wh.conversation_id, wh);
-                const phone = normalizePhone(getCallerPhoneFromWebhook(wh, ''));
+                const rawPhone = getCallerPhoneFromWebhook(wh, '');
+                if (!isRealPhoneForLookup(rawPhone)) continue;
+                const phone = normalizePhone(rawPhone);
                 if (!phone) continue;
                 if (!byPhone.has(phone)) byPhone.set(phone, []);
                 byPhone.get(phone).push(wh);
@@ -211,6 +260,7 @@ router.get('/dashboard', async (req, res) => {
             if (call.conversationId && lookup.byConversationId.has(call.conversationId)) {
                 return lookup.byConversationId.get(call.conversationId);
             }
+            if (isWidgetCallerId(call.callerPhone)) return null;
             const phone = normalizePhone(call.callerPhone);
             const candidates = lookup.byPhone.get(phone) || [];
             if (!candidates.length) return null;
@@ -385,21 +435,25 @@ router.get('/dashboard', async (req, res) => {
         // Lookup map for parent names based on normalized phone numbers
         const parentNameMap = new Map();
         const addParentName = (phone, name) => {
+            if (!isRealPhoneForLookup(phone)) return;
             if (!isUsableCallerName(name)) return;
             const normalized = normalizePhone(phone);
             if (normalized) parentNameMap.set(normalized, String(name).trim());
         };
 
         actualToursBooked.forEach(tour => addParentName(tour.phone, tour.parentName));
-        schoolWebhooks.forEach(wh => addParentName(
-            getCallerPhoneFromWebhook(wh, ''),
-            getCallerNameFromWebhook(wh, null)
-        ));
+        schoolWebhooks.forEach(wh => {
+            const callerPhone = getCallerPhoneFromWebhook(wh, '');
+            const callerName = getCallerNameFromWebhook(wh, null);
+            addParentName(callerPhone, callerName);
+        });
         callLogEntries.forEach(cl => addParentName(cl.from_phone_number, cl.callerName));
 
         const resolveName = (phone, specificName = null) => {
             if (isUsableCallerName(specificName)) return String(specificName).trim();
+            if (isWidgetCallerId(phone)) return 'Unknown Caller';
             const normalized = normalizePhone(phone);
+            if (!isRealPhoneForLookup(phone)) return 'Parent';
             const fromMap = parentNameMap.get(normalized);
             if (isUsableCallerName(fromMap)) return fromMap;
             return 'Parent';
@@ -474,12 +528,32 @@ router.get('/dashboard', async (req, res) => {
 
         // Add/Enrich with Webhooks (they have summaries & tour flags)
         webhookCalls.forEach(whc => {
-            const key = whc.conversationId || `${normalizePhone(whc.callerPhone)}_${new Date(whc.timestamp).getTime()}`;
-            if (allCallsMap.has(key)) {
-                const existing = allCallsMap.get(key);
-                allCallsMap.set(key, { ...existing, ...whc, id: existing.id });
+            const convKey = whc.conversationId || `${normalizePhone(whc.callerPhone)}_${new Date(whc.timestamp).getTime()}`;
+            if (allCallsMap.has(convKey)) {
+                const existing = allCallsMap.get(convKey);
+                allCallsMap.set(convKey, { ...existing, ...whc, id: existing.id });
+                return;
+            }
+
+            // Merge into VoiceAI / phone-only row for the same call (webhook uses conversationId key).
+            const whPhone = normalizePhone(whc.callerPhone);
+            const whTime = new Date(whc.timestamp).getTime();
+            let voiceKey = null;
+            for (const [key, existing] of allCallsMap.entries()) {
+                if (existing.conversationId) continue;
+                const phone = normalizePhone(existing.callerPhone);
+                const callTime = new Date(existing.timestamp).getTime();
+                if (phone && phone === whPhone && Math.abs(callTime - whTime) <= 5 * 60 * 1000) {
+                    voiceKey = key;
+                    break;
+                }
+            }
+
+            if (voiceKey) {
+                const existing = allCallsMap.get(voiceKey);
+                allCallsMap.set(voiceKey, { ...existing, ...whc, id: existing.id });
             } else {
-                allCallsMap.set(key, whc);
+                allCallsMap.set(convKey, whc);
             }
         });
 
@@ -587,11 +661,70 @@ router.get('/dashboard', async (req, res) => {
         }
 
         const webhookLookup = buildWebhookLookup(schoolWebhooks);
+        const insightMap = await resolveInsightsForWebhooks(schoolWebhooks, schoolObjectId, {
+            allowOpenAI: false,
+            persist: false,
+        });
+
+        const resolveCallWebhook = (call) => {
+            if (call.conversationId) {
+                return schoolWebhooks.find((w) => w.conversation_id === call.conversationId) || null;
+            }
+            return findWebhookForCall(call, webhookLookup);
+        };
+
+        const resolveInsightFromWebhook = (wh) => {
+            if (!wh) return null;
+            if (wh.comprehensive_result) {
+                return mapComprehensiveResult(wh.comprehensive_result, wh);
+            }
+            return mapSummaryFallback(wh);
+        };
+
+        const resolveCallParentSegment = (call) => {
+            const wh = resolveCallWebhook(call);
+            if (wh) {
+                return resolveInsightFromWebhook(wh)?.parentSegment || 'unknown';
+            }
+            if (!call.summary && !call.aiProcessed) return 'unknown';
+            return 'new_parent';
+        };
+
+        const resolveCallTags = (call) => {
+            const wh = resolveCallWebhook(call);
+            if (!wh) return [];
+            const fresh = resolveInsightFromWebhook(wh);
+            const baseTags = fresh?.tags || [];
+            return ensureTourBookedEmailMissingTag(baseTags, {
+                tourBooked: isTourBooked(wh),
+                parentEmail: resolveParentEmail(wh, wh.comprehensive_result),
+                emailMissing: isTourBookedEmailMissing(wh),
+            });
+        };
+
+        const resolveCallTourEmailMissing = (call, tags = []) => {
+            if (tags.some((tag) => String(tag).toLowerCase().includes('email missing'))) {
+                return true;
+            }
+            if (!call.tourBookingDetected) return false;
+            let wh = resolveCallWebhook(call);
+            if (!wh && call.callerPhone) {
+                const phone = normalizePhone(call.callerPhone);
+                wh = schoolWebhooks.find((w) => {
+                    if (!w.tour_booking_detected) return false;
+                    return normalizePhone(getCallerPhoneFromWebhook(w, '')) === phone;
+                }) || null;
+            }
+            if (!wh) return false;
+            return isTourBookedEmailMissing(wh);
+        };
 
         // Recent calls: top 20 within selected period
         const recentCalls = periodCalls
             .slice(0, 20)
-            .map(c => ({
+            .map(c => {
+                const tags = resolveCallTags(c);
+                return {
                 id: c.id,
                 conversationId: c.conversationId || null,
                 callerName: c.callerName,
@@ -603,8 +736,12 @@ router.get('/dashboard', async (req, res) => {
                 summary: resolveDashboardCallSummary(c, webhookLookup),
                 tourBookingDetected: c.tourBookingDetected || false,
                 tourBookingDate: c.tourBookingDate || null,
-                aiProcessed: c.aiProcessed || false
-            }));
+                tourEmailMissing: resolveCallTourEmailMissing(c, tags),
+                tags,
+                aiProcessed: c.aiProcessed || false,
+                parentSegment: resolveCallParentSegment(c),
+            };
+            });
 
         res.json({
             metrics: [
@@ -753,28 +890,19 @@ router.get('/daily-insights', async (req, res) => {
         const tourPhones = unprocessedTours.map(tour => normalizePhone(tour.phone)).filter(p => p);
 
         let allRelevantWebhooks = [];
-        if (unprocessedTours.length > 0) {
+        if (todaysTourDocs.length > 0) {
             const lookbackStart = new Date(todayStart);
             lookbackStart.setDate(lookbackStart.getDate() - 30);
             allRelevantWebhooks = await ElevenLabsWebhook.find({
                 type: 'post_call_transcription',
                 schoolId: schoolObjectId,
-                received_at: { $gte: lookbackStart }
-            }).select(WEBHOOK_LIST_PROJECTION).sort({ received_at: -1 }).limit(500).lean();
+                received_at: { $gte: lookbackStart },
+            })
+                .select('-raw_payload -audio_base64')
+                .sort({ received_at: -1 })
+                .limit(500)
+                .lean();
         }
-
-        // Create a phone-to-webhook map for efficient lookup
-        const phoneToWebhookMap = new Map();
-        allRelevantWebhooks.forEach(wh => {
-            const fromPhone = normalizePhone(getCallerPhoneFromWebhook(wh, ''));
-            const toPhone = normalizePhone(wh.metadata?.phone_call?.to_number || wh.metadata?.phone_call?.agent_number || '');
-            if (fromPhone && !phoneToWebhookMap.has(fromPhone)) {
-                phoneToWebhookMap.set(fromPhone, wh);
-            }
-            if (toPhone && !phoneToWebhookMap.has(toPhone)) {
-                phoneToWebhookMap.set(toPhone, wh);
-            }
-        });
 
         const normalizeName = (name) =>
             String(name || '')
@@ -783,71 +911,77 @@ router.get('/daily-insights', async (req, res) => {
                 .replace(/\s+/g, ' ')
                 .trim();
 
+        const getWebhookReceivedMs = (wh) => (
+            wh.metadata?.start_time_unix_secs
+                ? wh.metadata.start_time_unix_secs * 1000
+                : new Date(wh.received_at).getTime()
+        );
+
+        const scoreWebhookForTour = (wh, tour) => {
+            const tourPhone = normalizePhone(tour.phone);
+            const fromPhone = normalizePhone(getCallerPhoneFromWebhook(wh, ''));
+            const tourName = normalizeName(tour.parentName);
+            const extractedName = normalizeName(wh.comprehensive_result?.parent_name || '');
+            const summaryText = normalizeName(wh.summary || wh.comprehensive_result?.summary || '');
+
+            const phoneMatch = Boolean(tourPhone && fromPhone && tourPhone === fromPhone);
+            const nameMatch = Boolean(
+                tourName && (
+                    extractedName.includes(tourName) ||
+                    tourName.includes(extractedName) ||
+                    summaryText.includes(tourName)
+                )
+            );
+
+            if (!phoneMatch && !nameMatch) return -1;
+
+            let score = 0;
+            if (phoneMatch) score += 8;
+            if (nameMatch) score += 5;
+            if (wh.tour_booking_detected) score += 10;
+
+            const tourEmail = String(tour.email || '').trim().toLowerCase();
+            const whEmail = String(
+                wh.comprehensive_result?.parent_email || wh.tour_booking_extracted?.email || ''
+            ).trim().toLowerCase();
+            if (tourEmail && whEmail && tourEmail === whEmail) score += 30;
+            else if (tourEmail && isValidConfirmedEmail(tourEmail) && isValidConfirmedEmail(whEmail)) {
+                score -= 5;
+            }
+
+            const tourCreatedMs = new Date(tour.createdAt || tour.scheduledAt).getTime();
+            const whReceivedMs = getWebhookReceivedMs(wh);
+            const createdDeltaMin = Math.abs(tourCreatedMs - whReceivedMs) / (1000 * 60);
+            if (createdDeltaMin <= 3) score += 35;
+            else if (createdDeltaMin <= 15) score += 20;
+            else if (createdDeltaMin <= 60) score += 10;
+            else if (createdDeltaMin <= 180) score += 4;
+
+            const tourSchedMs = new Date(tour.scheduledAt).getTime();
+            const schedDeltaHours = Math.abs(tourSchedMs - whReceivedMs) / (1000 * 60 * 60);
+            score += Math.max(0, 12 - schedDeltaHours);
+
+            return score;
+        };
+
         /**
-         * Match a tour booking to the best-effort call webhook (shared for extraction + question merge).
-         * @param {Set|null} restrictUsedIds - name-based fallback skips webhooks already linked for batch extraction.
+         * Match a tour booking to the call that created it (not just the latest call from the same phone).
+         * @param {Set|null} restrictUsedIds - skips webhooks already linked for batch extraction.
          */
         const linkWebhookToTour = (tour, restrictUsedIds) => {
-            const tourPhone = normalizePhone(tour.phone);
-            let linkedWebhook = null;
+            const ranked = allRelevantWebhooks
+                .map((wh) => ({ wh, score: scoreWebhookForTour(wh, tour) }))
+                .filter((entry) => entry.score >= 0)
+                .sort((a, b) => b.score - a.score);
 
-            if (tourPhone) {
-                linkedWebhook = phoneToWebhookMap.get(tourPhone) || null;
-                if (!linkedWebhook) {
-                    linkedWebhook = allRelevantWebhooks.find(wh => {
-                        const fromPhone = normalizePhone(getCallerPhoneFromWebhook(wh, ''));
-                        const toPhone = normalizePhone(wh.metadata?.phone_call?.to_number || wh.metadata?.phone_call?.agent_number || '');
-                        return (
-                            (fromPhone && fromPhone.includes(tourPhone)) ||
-                            (tourPhone.includes(fromPhone) && !!fromPhone) ||
-                            (toPhone && toPhone.includes(tourPhone)) ||
-                            (tourPhone.includes(toPhone) && !!toPhone)
-                        );
-                    }) || null;
-                }
+            if (ranked.length === 0) return null;
+
+            if (restrictUsedIds) {
+                const unused = ranked.find((entry) => !restrictUsedIds.has(String(entry.wh._id)));
+                return unused ? unused.wh : ranked[0].wh;
             }
 
-            // Fallback for transcripts without usable phone metadata: match by parent name + nearest call time.
-            if (!linkedWebhook) {
-                const tourName = normalizeName(tour.parentName);
-                const tourTimeMs = new Date(tour.scheduledAt).getTime();
-
-                if (tourName) {
-                    const candidates = allRelevantWebhooks.filter(wh => {
-                        if (restrictUsedIds && restrictUsedIds.has(String(wh._id))) return false;
-
-                        const extractedName = normalizeName(wh.comprehensive_result?.parent_name || '');
-                        const summaryText = normalizeName(wh.summary || '');
-                        const hasNameMatch =
-                            extractedName.includes(tourName) ||
-                            tourName.includes(extractedName) ||
-                            summaryText.includes(tourName);
-
-                        if (!hasNameMatch) return false;
-
-                        const whTime = wh.metadata?.start_time_unix_secs
-                            ? wh.metadata.start_time_unix_secs * 1000
-                            : new Date(wh.received_at).getTime();
-                        const hoursDelta = Math.abs(tourTimeMs - whTime) / (1000 * 60 * 60);
-                        return hoursDelta <= 72;
-                    });
-
-                    if (candidates.length > 0) {
-                        candidates.sort((a, b) => {
-                            const aTime = a.metadata?.start_time_unix_secs
-                                ? a.metadata.start_time_unix_secs * 1000
-                                : new Date(a.received_at).getTime();
-                            const bTime = b.metadata?.start_time_unix_secs
-                                ? b.metadata.start_time_unix_secs * 1000
-                                : new Date(b.received_at).getTime();
-                            return Math.abs(tourTimeMs - aTime) - Math.abs(tourTimeMs - bTime);
-                        });
-                        linkedWebhook = candidates[0];
-                    }
-                }
-            }
-
-            return linkedWebhook;
+            return ranked[0].wh;
         };
 
         const usedWebhookIds = new Set();
@@ -872,26 +1006,57 @@ router.get('/daily-insights', async (req, res) => {
             const enriched = enrichedToursMap.get(tour._id.toString()) || { ...tour, id: tour._id.toString() };
             const wh = linkWebhookToTour(tour, null);
             const summaryForQuestions = wh?.summary || enriched.highlights || tour.highlights || '';
-            const questionsAsked = mergeQuestionLists(
+            const questionsAsked = filterSchoolQuestions(mergeQuestionLists(
                 enriched.questionsAsked,
                 mergeParentQuestionsFromExtraction(wh?.comprehensive_result, { summaryText: summaryForQuestions })
-            );
+            ));
+            const tourTalkingPoints = extractTourTalkingPoints(wh?.comprehensive_result);
             const linked = enriched.linkedWebhook || wh;
+            const tourEmailOptions = { extraEmails: [enriched.email] };
+            const tourTags = (() => {
+                const fromExtracted = Array.isArray(linked?.extractedTags) ? linked.extractedTags : [];
+                const fromComprehensive = Array.isArray(wh?.comprehensive_result?.tags)
+                    ? wh.comprehensive_result.tags
+                    : [];
+                const baseTags = fromExtracted.length ? fromExtracted : fromComprehensive;
+                const tourBooked = Boolean(wh?.tour_booking_detected);
+                const parentEmail = wh
+                    ? resolveParentEmail(wh, wh?.comprehensive_result, tourEmailOptions)
+                    : (isValidConfirmedEmail(enriched.email) ? String(enriched.email).trim() : '');
+                const emailMissing = wh
+                    ? isTourBookedEmailMissing(wh, wh?.comprehensive_result, tourEmailOptions)
+                    : !isValidConfirmedEmail(enriched.email);
+                if (baseTags.length || tourBooked) {
+                    return ensureTourBookedEmailMissingTag(baseTags, {
+                        tourBooked,
+                        parentEmail,
+                        emailMissing,
+                    });
+                }
+                if (emailMissing) {
+                    return ensureTourBookedEmailMissingTag([], { tourBooked: true, parentEmail: '', emailMissing: true });
+                }
+                return [];
+            })();
+            const resolvedTourEmail = wh
+                ? resolveParentEmail(wh, wh?.comprehensive_result, tourEmailOptions)
+                : (isValidConfirmedEmail(enriched.email) ? String(enriched.email).trim() : '');
             return {
                 id: enriched.id,
                 parentName: enriched.parentName || 'Parent',
                 phone: enriched.phone || '',
-                email: enriched.email || '',
+                email: resolvedTourEmail || (isValidConfirmedEmail(enriched.email) ? String(enriched.email).trim() : ''),
                 childName: enriched.childName || '',
                 childAge: enriched.childAge || '',
                 reason: enriched.reason || enriched.purpose || 'Enrollment Inquiry',
                 scheduledAt: enriched.scheduledAt,
                 calendarProvider: enriched.calendarProvider || null,
                 questionsAsked,
+                tourTalkingPoints,
                 highlights: enriched.highlights || enriched.notes || '',
                 callSummary: enriched.callSummary || wh?.summary || '',
                 reminderSent: enriched.reminderSent || false,
-                tags: Array.isArray(linked?.extractedTags) ? linked.extractedTags : [],
+                tags: tourTags,
                 language: linked?.extractedLanguage || '',
             };
         });
@@ -1129,7 +1294,9 @@ router.get('/call-logs', async (req, res) => {
             const byPhone = new Map();
             for (const wh of webhooks) {
                 if (wh.conversation_id) byConversationId.set(wh.conversation_id, wh);
-                const phone = normalizePhone(getCallerPhoneFromWebhook(wh, ''));
+                const rawPhone = getCallerPhoneFromWebhook(wh, '');
+                if (!isRealPhoneForLookup(rawPhone)) continue;
+                const phone = normalizePhone(rawPhone);
                 if (!phone) continue;
                 if (!byPhone.has(phone)) byPhone.set(phone, []);
                 byPhone.get(phone).push(wh);
@@ -1141,6 +1308,7 @@ router.get('/call-logs', async (req, res) => {
             if (call.conversationId && lookup.byConversationId.has(call.conversationId)) {
                 return lookup.byConversationId.get(call.conversationId);
             }
+            if (isWidgetCallerId(call.callerPhone)) return null;
             const phone = normalizePhone(call.callerPhone);
             const candidates = lookup.byPhone.get(phone) || [];
             if (!candidates.length) return null;
@@ -1321,8 +1489,7 @@ router.get('/calls/:conversationId/audio', async (req, res) => {
         if (audioWebhook && audioWebhook.audio_base64) {
             console.log(`[Audio] Serving from cache: ${conversationId}`);
             const audioBuffer = Buffer.from(audioWebhook.audio_base64, 'base64');
-            res.set('Content-Type', 'audio/mpeg');
-            return res.send(audioBuffer);
+            return sendAudioBufferWithRange(req, res, audioBuffer);
         }
 
         // ── Strategy 2: Mock/Test Fallback ────────────────
@@ -1330,8 +1497,7 @@ router.get('/calls/:conversationId/audio', async (req, res) => {
             console.log(`[Audio] Serving mock silence for test ID: ${conversationId}`);
             // 1 second of silence (tiny valid MP3)
             const silentMp3 = Buffer.from('SUQzBAAAAAABAFRYWFgAAAASAAADbWFqb3JfYnJhbmQAZGFzaABUWFhYAAAAEQAAAD1taW5vcl92ZXJzaW9uADBUWFhYAAAAHAAAAHByZWRvbWluYW50X2JyYW5kAGlzbzZtcDQxAFRTU0UAAAAPAAADTGF2ZjYwLjMuMTAwAAAAAAAAAAAAAAD/80MUAAAAAAAAAAAAAAAAAAAAAABYaW5nAAAADwAAABIAABm6AAAAAAAAAAAAAAAAAAAAAP/zQxQEAAB8AAAAAA', 'base64');
-            res.set('Content-Type', 'audio/mpeg');
-            return res.send(silentMp3);
+            return sendAudioBufferWithRange(req, res, silentMp3);
         }
 
         // ── Strategy 3: Fetch Directly from ElevenLabs API (Proxy) ────────
@@ -1346,8 +1512,8 @@ router.get('/calls/:conversationId/audio', async (req, res) => {
 
                 if (response.status === 200) {
                     console.log(`[Audio Proxy] Success for: ${conversationId}`);
-                    res.set('Content-Type', 'audio/mpeg');
-                    return res.send(response.data);
+                    const audioBuffer = Buffer.from(response.data);
+                    return sendAudioBufferWithRange(req, res, audioBuffer);
                 }
             } catch (proxyErr) {
                 console.warn(`[Audio Proxy] Failed for ${conversationId}: ${proxyErr.response?.status || proxyErr.message}`);

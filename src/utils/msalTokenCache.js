@@ -19,7 +19,7 @@ function logOutlookCacheAlert(schoolId, title, message, metadata = {}) {
         if (typeof AlertService?.create === 'function') {
             AlertService.create({
                 type: 'OUTLOOK_ERROR',
-                severity: 'WARNING',
+                severity: 'CRITICAL',
                 schoolId,
                 title,
                 message,

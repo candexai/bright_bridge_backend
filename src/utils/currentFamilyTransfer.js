@@ -46,7 +46,9 @@ const AGENT_CURRENT_FAMILY_PATTERNS = [
 ];
 
 function isOpeningFamilyQuestion(text) {
-    return /\bare you (?:a )?current(?: enrolled)? family\b/i.test(String(text || ''));
+    const value = String(text || '');
+    return /\b(?:are you|let me know if you(?:'re| are)|if you(?:'re| are))(?: a)? current(?: enrolled)? family\b/i.test(value)
+        || /\bcurrent enrolled family,?\s+or\b/i.test(value);
 }
 
 function normalizeRole(role) {
@@ -158,6 +160,10 @@ function agentConfirmedCurrentFamily(agentText) {
         if (line.length > MAX_AGENT_UTTERANCE_CHARS || isPromptLeak(line) || isOpeningFamilyQuestion(line)) {
             continue;
         }
+        // Nora asking a question is not confirming current-family status.
+        if (/\?/.test(line) && /\bcurrent(?: enrolled)? family\b/i.test(line)) {
+            continue;
+        }
         if (AGENT_CURRENT_FAMILY_PATTERNS.some((pattern) => pattern.test(line))) return true;
     }
     return false;
@@ -168,10 +174,7 @@ function agentConfirmedCurrentFamilyFromTranscript(transcriptArray) {
 }
 
 function isCurrentFamilyCall(transcriptArray) {
-    if (callerIdentifiedAsCurrentFamilyFromTranscript(transcriptArray)) {
-        return true;
-    }
-    return agentConfirmedCurrentFamilyFromTranscript(transcriptArray);
+    return callerIdentifiedAsCurrentFamilyFromTranscript(transcriptArray);
 }
 
 function isCurrentFamilyTransferCall(transcriptArray) {
@@ -265,6 +268,11 @@ function isCorruptedCurrentFamilySummary(summary) {
     return /you are nora|virtual scheduling assistant|knowledge base/i.test(String(summary || ''));
 }
 
+function isHallucinatedCurrentFamilySummary(summary) {
+    return /identified as a current enrolled family member/i.test(String(summary || ''))
+        || /transferred to the front desk/i.test(String(summary || ''));
+}
+
 function resolveWebhookSummary(webhook) {
     const stored = String(webhook?.summary || '').trim();
     const transcript = Array.isArray(webhook?.transcript) ? webhook.transcript : [];
@@ -279,11 +287,19 @@ function resolveWebhookSummary(webhook) {
         return buildCurrentFamilyTransferResult(transcript).summary;
     }
 
+    if (stored && isHallucinatedCurrentFamilySummary(stored)) {
+        return 'No meaningful interaction. The call was interrupted or the caller did not engage.';
+    }
+
+    const fromComprehensive = String(webhook?.comprehensive_result?.summary || '').trim();
+    if (fromComprehensive && isHallucinatedCurrentFamilySummary(fromComprehensive)) {
+        return 'No meaningful interaction. The call was interrupted or the caller did not engage.';
+    }
+
     if (stored && !isNoMeaningfulInteractionSummary(stored) && !isCorruptedCurrentFamilySummary(stored)) {
         return stored;
     }
 
-    const fromComprehensive = String(webhook?.comprehensive_result?.summary || '').trim();
     if (fromComprehensive && !isNoMeaningfulInteractionSummary(fromComprehensive)) {
         return fromComprehensive;
     }

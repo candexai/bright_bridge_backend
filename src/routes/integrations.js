@@ -223,7 +223,7 @@ router.get('/outlook/callback', async (req, res) => {
         const AlertService = require('../services/alertService');
         AlertService.create({
             type: 'OUTLOOK_ERROR',
-            severity: 'WARNING',
+            severity: 'CRITICAL',
             schoolId: req.query.state,
             title: 'Outlook OAuth connection failed',
             message: err.message,

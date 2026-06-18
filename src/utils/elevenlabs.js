@@ -818,6 +818,38 @@ async function registerTool(schoolId, agentId) {
     }
 }
 
+async function deleteTool(toolId) {
+    const baseUrl = process.env.ELEVENLABS_API_URL;
+    if (!baseUrl || !toolId) {
+        console.warn('[Agent Tool Delete] ELEVENLABS_API_URL or toolId not configured');
+        return false;
+    }
+
+    try {
+        const url = `${baseUrl}/api/v1/tools/${encodeURIComponent(toolId)}`;
+        console.log(`[Agent Tool Delete] DELETE ${url}`);
+        const response = await axios.delete(url, { headers: elevenLabsHeaders() });
+        console.log(`[Agent Tool Delete] Status: ${response.status}`);
+        return true;
+    } catch (err) {
+        if (err.response?.status === 404) {
+            console.warn(`[Agent Tool Delete] Tool ${toolId} not found (already deleted)`);
+            return true;
+        }
+        console.error(`[Agent Tool Delete] Failed to delete tool ${toolId}`);
+        console.error(`[Agent Tool Delete] Error Status:`, err.response?.status);
+        console.error(`[Agent Tool Delete] Error Data:`, JSON.stringify(err.response?.data || {}, null, 2));
+        return false;
+    }
+}
+
+function getBookedSlotsToolIds(toolIds = []) {
+    return (Array.isArray(toolIds) ? toolIds : [])
+        .map((id) => String(id).trim())
+        .filter(Boolean)
+        .filter((id) => id !== GLOBAL_TIME_TOOL_ID);
+}
+
 // Helper function to format Q&A pairs into text for knowledge base ingestion
 function formatQAPairsForKB(qaPairs) {
     if (!Array.isArray(qaPairs) || qaPairs.length === 0) {
@@ -1399,6 +1431,8 @@ module.exports = {
     deletePhoneNumber,
     updatePhoneNumber,
     registerTool,
+    deleteTool,
+    getBookedSlotsToolIds,
     patchAgentPrompt,
     patchAgentSystemPrompt,
     patchAgentFirstMessage,

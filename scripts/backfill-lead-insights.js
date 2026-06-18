@@ -61,6 +61,13 @@ async function backfillLeadInsights() {
             insightData,
             transcriptHash: hashTranscript(getTranscriptText(webhook)),
         });
+
+        if (Array.isArray(insightData.tags) && insightData.tags.length > 0) {
+            await ElevenLabsWebhook.updateOne(
+                { _id: webhook._id },
+                { $set: { extractedTags: insightData.tags } }
+            );
+        }
         created += 1;
 
         if (created % 50 === 0) {

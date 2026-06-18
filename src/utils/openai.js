@@ -165,52 +165,140 @@ function dedupeCaseInsensitive(items) {
     return out;
 }
 
-/**
- * When structured question arrays are empty but the narrative summary describes
- * parent intent, derive short bullets so tour cards are never misleadingly blank.
- */
-function inferTopicsFromSummary(summaryText) {
-    const raw = String(summaryText || '').trim();
-    if (!raw) return [];
-    const lower = raw.toLowerCase();
-    if (
-        lower.includes('no meaningful interaction') ||
-        lower.includes('caller did not engage') ||
-        lower.includes('primarily consisted of greetings')
-    ) {
-        return [];
-    }
-    const sentences = raw
-        .split(/(?<=[.!?])\s+/)
-        .map((s) => s.trim())
-        .filter((s) => s.length >= 20 && s.length <= 280);
-    const topicHints =
-        /ask|want|need|look(?:ing)? for|interest|concern|curious|question|tuition|fee|price|schedule|hours|enroll|program|curriculum|meal|food|ratio|teacher|camera|security|pickup|bus|nap|after[\s-]?school/i;
-    const out = [];
-    for (const sent of sentences) {
-        if (topicHints.test(sent)) {
-            out.push(sent.replace(/\s+/g, ' '));
+/** School/KB topics parents may ask about — not tour scheduling or booking logistics. */
+const SCHOOL_KB_PATTERNS = [
+    /\b(?:tuition|price|cost|fee|afford|billing|payment)\b|financial aid/i,
+    /\b(?:hours|schedule|scheduling|pickup|drop[\s-]?off|holiday|closure)\b|\b(?:open|close)\b/i,
+    /\b(?:meal|food|lunch|snack|allerg\w*|nutrition|diet)\b/i,
+    /\b(?:ratio|teacher|staff|classroom|credential)\b|certif/i,
+    /\b(?:curriculum|program|montessori|reggio|learning|development)\b|play[\s-]?based/i,
+    /\b(?:camera|security|safety|lock|visitor)\b/i,
+    /\b(?:nap|sleep|rest time)\b/i,
+    /\b(?:bus|transport)\b/i,
+    /after[\s-]?school|summer camp|extended care/i,
+    /\b(?:waitlist|availability|spots?|opening|capacity)\b/i,
+    /\b(?:infant|toddler|preschool|kindergarten)\b|pre[\s-]?k|age group/i,
+    /\b(?:potty|toilet|diaper)\b/i,
+    /\b(?:vaccin|immuniz|health|sick|illness)\b/i,
+    /\b(?:discipline|behavior)\b/i,
+    /\b(?:outdoor|playground|gym)\b/i,
+];
+
+const BOOKING_ONLY_PATTERNS = [
+    /book(?:ed|ing)?\s+(?:a\s+)?tour/i,
+    /wanted\s+to\s+book/i,
+    /express(?:ed)?\s+interest/i,
+    /tour\s+was\s+(?:successfully\s+)?schedul/i,
+    /successfully\s+scheduled\s+for/i,
+    /scheduled\s+(?:the\s+)?tour/i,
+    /all\s+required\s+information\s+was\s+collected/i,
+    /enroll(?:ment)?\s+as\s+soon\s+as/i,
+    /immediate\s+need\s+for\s+enroll/i,
+    /tour\s+for\s+their\s+child/i,
+    /tour\s+schedul/i,
+    /schedul.*\btour\b/i,
+    /enrollment\s+timing/i,
+    /enrollment\s+urgency/i,
+    /enrollment\s+target/i,
+    /when\s+(?:are\s+you\s+)?hoping\s+to\s+enroll/i,
+    /caller.{0,60}(?:book|schedul|enroll)/i,
+];
+
+function matchesSchoolKbPattern(text) {
+    return SCHOOL_KB_PATTERNS.some((pattern) => pattern.test(String(text || '')));
+}
+
+function isTourBookingOrEnrollmentLogistics(text) {
+    const t = String(text || '').trim();
+    if (!t) return true;
+    if (BOOKING_ONLY_PATTERNS.some((pattern) => pattern.test(t))) return true;
+    if (/\btour\b/i.test(t)) return true;
+    if (/\bschedul(?:ed|ing)\b/i.test(t) && !/\b(?:hours|pickup|drop[\s-]?off)\b/i.test(t)) return true;
+    return false;
+}
+
+function isSchoolKbTopic(text) {
+    if (isTourBookingOrEnrollmentLogistics(text)) return false;
+    return matchesSchoolKbPattern(text);
+}
+
+function isPureBookingBoilerplate(text) {
+    return isTourBookingOrEnrollmentLogistics(text);
+}
+
+/** Keep only real school/KB questions — exclude tour booking recap sentences. */
+function filterSchoolQuestions(items) {
+    return dedupeCaseInsensitive(
+        normalizeStringList(items).filter((item) => isSchoolKbTopic(item) && !isPureBookingBoilerplate(item))
+    );
+}
+
+function filterSchoolTalkingPoints(items) {
+    return dedupeCaseInsensitive(
+        normalizeStringList(items).filter(
+            (item) => !isPureBookingBoilerplate(item) && isSchoolKbTopic(item)
+        )
+    );
+}
+
+function buildStaffTalkingPointsFromQuestions(questions) {
+    const points = [];
+    for (const q of questions.slice(0, 4)) {
+        const lower = q.toLowerCase();
+        if (/tuition|price|cost|fee|afford|financial/i.test(lower)) {
+            points.push('Be prepared to walk through tuition, payment schedules, and any available discounts or assistance.');
+        } else if (/hours|schedule|pickup|drop[\s-]?off|open|close/i.test(lower)) {
+            points.push('Review daily hours, drop-off and pickup procedures, and holiday closures.');
+        } else if (/meal|food|lunch|snack|allerg/i.test(lower)) {
+            points.push('Show the meal program, snack policy, and how allergies are handled.');
+        } else if (/ratio|teacher|staff|classroom/i.test(lower)) {
+            points.push('Highlight teacher credentials, class sizes, and classroom structure.');
+        } else if (/curriculum|program|montessori|reggio|learning/i.test(lower)) {
+            points.push('Walk through the curriculum, daily activities, and developmental approach.');
+        } else if (/camera|security|safety/i.test(lower)) {
+            points.push('Cover building security, cameras, and safety protocols.');
+        } else if (/nap|sleep/i.test(lower)) {
+            points.push('Explain nap routines and how rest time is managed by age group.');
+        } else if (/bus|transport/i.test(lower)) {
+            points.push('Clarify transportation options if applicable.');
+        } else if (/after[\s-]?school|summer camp/i.test(lower)) {
+            points.push('Discuss extended care or summer program availability.');
+        } else if (/waitlist|availability|spots|opening/i.test(lower)) {
+            points.push('Confirm current classroom availability and waitlist timelines.');
+        } else {
+            points.push(`Address their question about: ${q.replace(/\?+$/, '').trim()}.`);
         }
-        if (out.length >= 8) break;
     }
-    return dedupeCaseInsensitive(out);
+    return dedupeCaseInsensitive(points).slice(0, 4);
 }
 
 /**
  * @param {object} extracted - Parsed JSON from getComprehensivePrompt
- * @param {{ summaryText?: string }} [extra] - optional webhook summary / highlights when extracted.summary is empty
+ * @returns {string[]}
+ */
+function extractTourTalkingPoints(extracted) {
+    const schoolQuestions = mergeParentQuestionsFromExtraction(extracted);
+    if (schoolQuestions.length === 0) return [];
+    const root = extracted && typeof extracted === 'object' ? extracted : {};
+    const fromOnePager = filterSchoolTalkingPoints(root.one_pager?.tour_talking_points);
+    if (fromOnePager.length > 0) return fromOnePager.slice(0, 4);
+    return buildStaffTalkingPointsFromQuestions(schoolQuestions);
+}
+
+/**
+ * @param {object} extracted - Parsed JSON from getComprehensivePrompt
+ * @param {{ summaryText?: string }} [extra] - unused; kept for callers
  * @returns {string[]}
  */
 function mergeParentQuestionsFromExtraction(extracted, extra = {}) {
     const root = extracted && typeof extracted === 'object' ? extracted : {};
     const fromOnePager = normalizeStringList(root.one_pager?.what_they_asked_about);
     const fromTop = normalizeStringList(root.questions_asked);
-    const primary = dedupeCaseInsensitive([...fromOnePager, ...fromTop]);
+    const primary = filterSchoolQuestions([...fromOnePager, ...fromTop]);
     if (primary.length > 0) return primary;
-    const topics = dedupeCaseInsensitive(normalizeStringList(root.topics_of_interest));
+    const topics = filterSchoolQuestions(normalizeStringList(root.topics_of_interest));
     if (topics.length > 0) return topics;
-    const summaryText = String(root.summary || extra.summaryText || '').trim();
-    return inferTopicsFromSummary(summaryText);
+    return [];
 }
 
 /** Merge multiple question/topic lists (booking cache + webhook extraction). */
@@ -261,10 +349,13 @@ async function extractTourDetails(transcriptText, existingDetails = {}) {
             childAge: extracted.child_age ? (Array.isArray(extracted.child_age) ? extracted.child_age[0] : extracted.child_age) : existingDetails.childAge || '',
             purpose: extracted.summary || existingDetails.purpose || 'Brief inquiry',
             questionsAsked: mergeParentQuestionsFromExtraction(extracted),
-            notes: extracted.one_pager?.tour_talking_points
-                ? extracted.one_pager.tour_talking_points.join('\n')
-                : (extracted.topics_of_interest ? extracted.topics_of_interest.join(', ') : ''),
-            tourTalkingPoints: extracted.one_pager?.tour_talking_points || [],
+            notes: (() => {
+                const talking = extractTourTalkingPoints(extracted);
+                if (talking.length) return talking.join('\n');
+                const topics = filterSchoolQuestions(extracted.topics_of_interest);
+                return topics.length ? topics.join(', ') : '';
+            })(),
+            tourTalkingPoints: extractTourTalkingPoints(extracted),
             tags: extracted.tags || [],
             language: extracted.language_spoken || '',
             missingDetails: extracted.missing_details || []
@@ -342,10 +433,13 @@ async function batchExtractTourDetails(tourBatch) {
                     childAge: extracted.child_age ? (Array.isArray(extracted.child_age) ? extracted.child_age[0] : extracted.child_age) : tour.existingDetails?.childAge || '',
                     purpose: extracted.summary || tour.existingDetails?.purpose || 'Brief inquiry',
                     questionsAsked: mergeParentQuestionsFromExtraction(extracted),
-                    notes: extracted.one_pager?.tour_talking_points
-                        ? extracted.one_pager.tour_talking_points.join('\n')
-                        : (extracted.topics_of_interest ? extracted.topics_of_interest.join(', ') : ''),
-                    tourTalkingPoints: extracted.one_pager?.tour_talking_points || [],
+                    notes: (() => {
+                        const talking = extractTourTalkingPoints(extracted);
+                        if (talking.length) return talking.join('\n');
+                        const topics = filterSchoolQuestions(extracted.topics_of_interest);
+                        return topics.length ? topics.join(', ') : '';
+                    })(),
+                    tourTalkingPoints: extractTourTalkingPoints(extracted),
                     tags: extracted.tags || [],
                     language: extracted.language_spoken || '',
                     missingDetails: extracted.missing_details || []
@@ -388,5 +482,7 @@ module.exports = {
     extractTourDetails,
     batchExtractTourDetails,
     mergeParentQuestionsFromExtraction,
-    mergeQuestionLists
+    mergeQuestionLists,
+    filterSchoolQuestions,
+    extractTourTalkingPoints,
 };

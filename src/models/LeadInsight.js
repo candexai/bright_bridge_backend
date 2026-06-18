@@ -15,7 +15,7 @@ const leadInsightSchema = new mongoose.Schema({
     isHotLead: { type: Boolean, default: false, index: true },
     parentSegment: {
         type: String,
-        enum: ['new_parent', 'current_family'],
+        enum: ['new_parent', 'current_family', 'unknown'],
         default: 'new_parent',
         index: true,
     },

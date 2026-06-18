@@ -12,6 +12,18 @@ function isUsableCallerName(name) {
     return !PLACEHOLDER_CALLER_NAMES.has(normalized.toLowerCase());
 }
 
+/** ElevenLabs web widget sessions reuse a stable user_id — not a phone number. */
+function isWidgetCallerId(value) {
+    return /^user_/i.test(String(value || '').trim());
+}
+
+/** Only real phone numbers should be used for cross-call name lookup. */
+function isRealPhoneForLookup(phone) {
+    if (isWidgetCallerId(phone)) return false;
+    const digits = String(phone || '').replace(/\D/g, '');
+    return digits.length >= 10;
+}
+
 /**
  * Resolve the caller's name from an ElevenLabs webhook document.
  * Prefers tour_booking_extracted.name, then comprehensive_result.parent_name.
@@ -102,4 +114,6 @@ module.exports = {
     getCallerPhoneFromWebhook,
     getCallerNameFromWebhook,
     isUsableCallerName,
+    isWidgetCallerId,
+    isRealPhoneForLookup,
 };

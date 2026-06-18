@@ -27,7 +27,7 @@ CURRENT ENROLLED FAMILY TRANSFERS:
 
 - If the caller says they are a current family, existing family, already enrolled, or "familia actual", and Nora connects or transfers them to the front desk, this IS meaningful interaction.
 - call_state: use "partial" (not "no_interaction").
-- tags: MUST include "Current Family".
+- tags: MUST include "Current Family" ONLY when the caller explicitly said they are a current/existing family or already enrolled in the transcript. NEVER tag Current Family because Nora asked the opening routing question or because the summary assumes it.
 - summary: state clearly that the caller identified as a current enrolled family member and that the call was transferred (or Nora offered to connect them) to the front desk. If the caller asked any other questions before or during the call, include those in the summary and in questions_asked.
 - NEVER write "No meaningful interaction" for these calls.
 
@@ -38,6 +38,9 @@ Required fields to extract (set to null if not mentioned):
 2. parent_phone
 
 3. parent_email
+
+- Set to null if the parent never provided a confirmed email, OR if the parent rejected Nora's email read-back twice and Nora skipped email (look for agent saying "tour details by phone" or moving on to child's name after email failures).
+- Do NOT keep a rejected/unconfirmed email address in parent_email. Spoken forms like "name at gmail dot com" are NOT valid — use null unless the parent confirmed a real address (name@domain.com).
 
 4. child_name (array - supports siblings, e.g. ["Sid", "Maya"])
 
@@ -50,14 +53,14 @@ Tour booking:
 - tour_time: "HH:MM" or null
 - tour_datetime_iso: ISO 8601 or null
 
-Parent questions and interests (ONLY what was explicitly asked or stated):
+Parent questions and interests (ONLY school/KB topics the parent explicitly asked about):
 
-- questions_asked: array of short plain-English strings of actual questions the parent raised
-- topics_of_interest: array of short plain-English strings of topics/concerns the parent showed interest in
+- questions_asked: array of short plain-English strings of actual questions the parent raised about the school (programs, policies, tuition, hours, meals, ratios, etc.)
+- topics_of_interest: array of short plain-English strings of school-related topics/concerns the parent showed interest in
 
-(e.g. "school hours", "meal/food provided", "teacher-to-student ratio", "after-school care", "cameras/security", "pickup service", "nap time", "start date")
+(e.g. "school hours", "meal/food provided", "teacher-to-student ratio", "after-school care", "cameras/security", "pickup service", "nap time", "tuition")
 
-MANDATORY: If the parent discussed enrollment timing, scheduling a tour, tuition, programs, hours, or any school-related topic, you MUST populate both questions_asked and topics_of_interest (use topics when they did not literally ask a question). Never leave both arrays empty when the summary describes any parent intent beyond pure greetings.
+DO NOT include tour booking logistics in questions_asked or topics_of_interest (e.g. "booked a tour", "scheduled for Tuesday", "wants to enroll soon"). If the parent only booked a tour and did not ask about school topics, leave both arrays empty.
 
 - enrollment_urgency: "immediate" | "within weeks" | "specific month" | "unknown" - based on what parent said
 - enrollment_target_date: string or null (e.g. "June", "as soon as possible", "next month")
@@ -84,13 +87,15 @@ FAIL-SAFE RULES - Apply these ALWAYS, no exceptions:
 
 CONDITIONAL RULES - MANDATORY when conditions are met (apply ALL tags whose conditions are satisfied):
 
-- "Hot lead" - MANDATORY if parent shows strong interest, asks detailed questions, or mentions immediate enrollment needs. NEVER apply to current enrolled family calls that only requested a front-desk transfer with no pricing, facility, or program questions.
+- "Hot lead" - MANDATORY ONLY if the parent explicitly asked about school/KB topics (tuition, hours, programs, meals, teacher ratio, curriculum, etc.). NEVER apply for partial calls, calls that ended before collecting details, tour-only booking with no school questions, or when the caller only gave their name.
 - "Urgency: Immediate" - MANDATORY if parent needs enrollment ASAP (e.g., "starting next week", "as soon as possible", "immediate")
 - "Urgency: High" - MANDATORY if parent needs enrollment soon (within 1-2 months)
 - "Urgency: Medium" - MANDATORY if parent is planning ahead (3-6 months)
 - "Urgency: Low" - MANDATORY if parent is just exploring (6+ months out)
 - "Price sensitive" - MANDATORY if parent asks about tuition, fees, or financial aid
 - "Tour requested" - MANDATORY if parent: explicitly asks for a tour OR expresses interest in booking a tour OR mentions wanting to visit the school OR discusses scheduling a tour OR agent offers to schedule a tour and parent engages with the offer
+- "Tour booked - email missing" - MANDATORY if tour_booked is true AND (parent_email is null/empty OR transcript shows Nora skipped email after two failed confirmations OR agent says "we will make sure you have your tour details by phone" / "tour details by phone" / similar)
+- "Unknown" - MANDATORY if caller gave no enrollment details, asked no school-related questions, did not request a tour, and was not transferred as a current family. Use call_state "no_interaction" or when summary indicates no meaningful engagement.
 - "Follow-up needed" - MANDATORY if parent requests callback or additional information
 - "First-time parent" - MANDATORY if parent appears to be new to childcare enrollment or asks basic questions
 - "Multiple children" - MANDATORY if parent mentioned having more than one child
@@ -162,9 +167,9 @@ Generate three outputs from this data:
 
 },
 
-"what_they_asked_about": [string],  // short bullet-ready phrases, max 8
+"what_they_asked_about": [string],  // ONLY school/KB questions (tuition, hours, programs, etc.) — NEVER tour booking, scheduling, or enrollment timing (those go in enrollment target / summary)
 
-"tour_talking_points": [string]     // 2-4 suggestions for staff based on what parent cares about
+"tour_talking_points": [string]     // Staff tips tied to school/KB questions only — empty if parent only booked a tour
 
 }
 
@@ -234,9 +239,9 @@ Return ONLY a valid JSON object with this exact top-level structure:
 
 },
 
-"what_they_asked_about": [string],
+"what_they_asked_about": [string],  // ONLY school/KB questions — NEVER tour booking or enrollment timing
 
-"tour_talking_points": [string]
+"tour_talking_points": [string]     // Staff tips for school/KB questions only — empty if only booked a tour
 
 }
 
