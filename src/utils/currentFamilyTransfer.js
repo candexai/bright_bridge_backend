@@ -18,16 +18,28 @@ const MAX_QUESTION_CHARS = 180;
 
 const PROMPT_LEAK_PATTERN = /you are nora|virtual scheduling assistant|knowledge base|collect information|move to tour|general behavior|technical fallback|\{\{school/i;
 
-/** Short caller phrases that identify an existing enrolled family. */
+/**
+ * Short caller phrases that identify an existing enrolled family.
+ * Kept to reliable self-identification only — generic "front desk / representative"
+ * routing is handled via the extractor's guarded "Current Family" tag, because new
+ * families also sometimes ask for a human and must not be mislabeled as current.
+ */
 const CALLER_CURRENT_FAMILY_PATTERNS = [
     /^currents?\.?\s*$/i,
     /^current family\.?\s*$/i,
     /\b(i(?:'m| am)|we(?:'re| are))(?: a)? current family\b/i,
-    /\b(i(?:'m| am)|we(?:'re| are)) currently enrolled\b/i,
+    /\bcurrent family\b/i,
+    /\bcurrent(?:ly)? enrolled\b/i,
+    /\benrolled family\b/i,
+    /\b(i(?:'m| am)|we(?:'re| are))(?: an?)? enrolled\b/i,
     /^currently enrolled\.?\s*$/i,
     /\balready enrolled\b/i,
-    /\bexisting family\b/i,
+    /\bexisting (?:family|parent)\b/i,
+    /\balready go(?:es)? (?:there|here)\b/i,
+    // Spanish: existing / already-enrolled family
     /\bfamilia actual\b/i,
+    /\bfamilia inscrita\b/i,
+    /\b(?:ya\s+)?(?:est[aá]\s+)?inscrit[oa]s?\b/i,
     /^front desk\??\s*$/i,
     /\btransfer to\b/i,
 ];
@@ -273,9 +285,18 @@ function isHallucinatedCurrentFamilySummary(summary) {
         || /transferred to the front desk/i.test(String(summary || ''));
 }
 
+function hasCurrentFamilyTag(webhook) {
+    const cr = webhook?.comprehensive_result || null;
+    if (!cr || cr.call_state === 'no_interaction') return false;
+    const crTags = Array.isArray(cr.tags) ? cr.tags : [];
+    return crTags.some((t) => String(t).trim().toLowerCase() === 'current family');
+}
+
 function resolveWebhookSummary(webhook) {
     const stored = String(webhook?.summary || '').trim();
     const transcript = Array.isArray(webhook?.transcript) ? webhook.transcript : [];
+    const currentFamilyTagged = hasCurrentFamilyTag(webhook);
+    const callState = webhook?.comprehensive_result?.call_state || null;
     if (!transcript.length) {
         if (stored && !isNoMeaningfulInteractionSummary(stored) && !isCorruptedCurrentFamilySummary(stored)) {
             return stored;
@@ -287,13 +308,27 @@ function resolveWebhookSummary(webhook) {
         return buildCurrentFamilyTransferResult(transcript).summary;
     }
 
-    if (stored && isHallucinatedCurrentFamilySummary(stored)) {
-        return 'No meaningful interaction. The call was interrupted or the caller did not engage.';
+    // The extractor flagged this as a current family (guarded tag). Keep a proper
+    // current-family summary instead of rewriting it to "No meaningful interaction".
+    if (currentFamilyTagged) {
+        if (stored && !isCorruptedCurrentFamilySummary(stored)) return stored;
+        const fromCr = String(webhook?.comprehensive_result?.summary || '').trim();
+        if (fromCr && !isCorruptedCurrentFamilySummary(fromCr)) return fromCr;
+        return 'The caller identified as a current enrolled family member. The call was transferred to the front desk.';
     }
 
+    // A "current family / transferred to front desk" summary is only a hallucination when the
+    // call had NO real interaction. When the caller actually engaged (call_state partial/complete
+    // — e.g. gave name, phone, child details), that phrasing is legitimate, so keep the real
+    // summary and never overwrite it with "No meaningful interaction".
     const fromComprehensive = String(webhook?.comprehensive_result?.summary || '').trim();
-    if (fromComprehensive && isHallucinatedCurrentFamilySummary(fromComprehensive)) {
-        return 'No meaningful interaction. The call was interrupted or the caller did not engage.';
+    if (callState === 'no_interaction') {
+        if (stored && isHallucinatedCurrentFamilySummary(stored)) {
+            return 'No meaningful interaction. The call was interrupted or the caller did not engage.';
+        }
+        if (fromComprehensive && isHallucinatedCurrentFamilySummary(fromComprehensive)) {
+            return 'No meaningful interaction. The call was interrupted or the caller did not engage.';
+        }
     }
 
     if (stored && !isNoMeaningfulInteractionSummary(stored) && !isCorruptedCurrentFamilySummary(stored)) {

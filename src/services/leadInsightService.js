@@ -417,31 +417,38 @@ function detectHotLead({
     return true;
 }
 
+// Reliable current/existing-family self-identification only. Generic human-routing
+// ("front desk", "representative", "talk to the director") is intentionally excluded —
+// new families ask for a human too — and is instead covered by the guarded LLM tag.
+const CALLER_CURRENT_FAMILY_PATTERNS = [
+    /^currents?\.?$/i,
+    /^current family\.?$/i,
+    /\b(i(?:'m| am)|we(?:'re| are))(?: a)? current family\b/i,
+    /\bcurrent family\b/i,
+    /\bcurrent(?:ly)? enrolled\b/i,
+    /\benrolled family\b/i,
+    /\b(i(?:'m| am)|we(?:'re| are))(?: an?)? enrolled\b/i,
+    /\balready enrolled\b/i,
+    /\bexisting (?:family|parent)\b/i,
+    /\balready go(?:es)? (?:there|here)\b/i,
+    /\bfamilia actual\b/i,
+    /\bfamilia inscrita\b/i,
+    /\b(?:ya\s+)?(?:est[aá]\s+)?inscrit[oa]s?\b/i,
+    /^front desk\??$/i,
+];
+
 function callerIdentifiedAsCurrentFamily(callerText) {
     const callerHaystack = String(callerText || '').toLowerCase().trim();
     if (!callerHaystack) return false;
 
     const callerLines = callerHaystack.split(/\s*\|\s*|\n+/).map((line) => line.trim()).filter(Boolean);
     for (const line of callerLines) {
-        if (
-            /^currents?\.?$/i.test(line)
-            || /^current family\.?$/i.test(line)
-            || /\b(i(?:'m| am)|we(?:'re| are))(?: a)? current family\b/i.test(line)
-            || /\bcurrent family\b/i.test(line)
-            || /\balready enrolled\b/i.test(line)
-            || /\bexisting family\b/i.test(line)
-            || /^front desk\??$/i.test(line)
-        ) {
+        if (CALLER_CURRENT_FAMILY_PATTERNS.some((pattern) => pattern.test(line))) {
             return true;
         }
     }
 
-    return (
-        /\b(i(?:'m| am)|we(?:'re| are))(?: a)? current family\b/i.test(callerHaystack)
-        || /\bcurrent family\b/i.test(callerHaystack)
-        || /\balready enrolled\b/i.test(callerHaystack)
-        || /\bexisting family\b/i.test(callerHaystack)
-    );
+    return CALLER_CURRENT_FAMILY_PATTERNS.some((pattern) => pattern.test(callerHaystack));
 }
 
 function agentTriggeredCurrentFamilyTransfer(agentText) {
@@ -529,22 +536,27 @@ function detectParentSegment(tags, summary, webhookOrCallerText, options = {}) {
         ? webhookOrCallerText
         : null;
     const callerText = webhook ? getCallerText(webhook) : String(webhookOrCallerText || '');
-    const agentText = webhook ? getAgentText(webhook) : '';
 
-    // Current family requires transcript proof — never trust AI tags/summary alone.
+    const comprehensiveResult = options.comprehensiveResult
+        ?? (typeof webhookOrCallerText === 'object' ? webhookOrCallerText?.comprehensive_result : null)
+        ?? null;
+
+    // Current family: transcript proof, OR the extractor's guarded "Current Family" tag.
     if (webhook?.transcript && isCurrentFamilyCall(webhook.transcript)) {
         return 'current_family';
     }
     if (callerIdentifiedAsCurrentFamily(callerText)) {
         return 'current_family';
     }
-    if (callerIdentifiedAsCurrentFamily(callerText) && agentTriggeredCurrentFamilyTransfer(agentText)) {
+    // The comprehensive prompt only allows the "Current Family" tag when the caller explicitly
+    // self-identified as current/existing/enrolled, so trust it (except when nothing meaningful
+    // was said). This catches phrasings and ASR variance the regex above misses.
+    const tagList = Array.isArray(tags) ? tags : [];
+    const hasCurrentFamilyTag = tagList.some((t) => String(t).trim().toLowerCase() === 'current family');
+    if (hasCurrentFamilyTag && comprehensiveResult?.call_state !== 'no_interaction') {
         return 'current_family';
     }
 
-    const comprehensiveResult = options.comprehensiveResult
-        ?? (typeof webhookOrCallerText === 'object' ? webhookOrCallerText?.comprehensive_result : null)
-        ?? null;
     const questionsAsked = options.questionsAsked || [];
     const childName = options.childName || '';
     const childAge = options.childAge || '';

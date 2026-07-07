@@ -795,6 +795,8 @@ async function sendAdminEmailNotification(webhook, aiResult = null) {
                 ? (tourEmailMissing ? ' (Tour Booked - Email Missing)' : ' (Tour Booked)')
                 : ''
         }`;
+        const emailNotCaptured = tourBooked && tourEmailMissing;
+
         let emailBody = `Hello,
 
 A new call has been received and processed for ${school.name}.
@@ -802,7 +804,7 @@ A new call has been received and processed for ${school.name}.
 Call Details:
 - Caller Name/Number: ${callerNumber}
 - Call Duration: ${callDurationMin} min ${callDurationSec} sec
-- Call Recording: ${backendUrl}/api/school/calls/${webhook.conversation_id}/audio?token=${notificationToken}
+${parentEmail ? `- Parent Email: ${parentEmail}\n` : ''}- Call Recording: ${backendUrl}/api/school/calls/${webhook.conversation_id}/audio?token=${notificationToken}
 
 `;
 
@@ -822,16 +824,31 @@ ${summary}
 - Tour Scheduled: ${tourDateStr}
 ${tourNotes ? `- Notes: ${tourNotes}\n` : ''}
 `;
-            if (tourEmailMissing) {
-                emailBody += `ATTENTION: Tour was booked but the parent's email was NOT captured. Please call the parent back to collect their email for calendar invite and follow-up.
+        }
+
+        // Missing-email notice fires whenever a tour was booked without a captured email,
+        // regardless of whether a specific tour date/time was parsed.
+        if (emailNotCaptured) {
+            emailBody += `ATTENTION: A tour was booked but the parent's email was NOT captured on this call. Please call the parent back to collect their email for the calendar invite and follow-up.
 
 `;
-            }
         }
 
         emailBody += `You can view the full call details in your dashboard.
 
-Best regards,
+`;
+
+        if (emailNotCaptured) {
+            emailBody += `========================================
+*** EMAIL NOT CAPTURED ***
+We did NOT capture the parent's email address on this call.
+Please call the parent back to collect it.
+========================================
+
+`;
+        }
+
+        emailBody += `Best regards,
 Childcare Enrollment AI Platform`;
 
         // Send email using the school's preferred provider (Google/Outlook), with SMTP fallback.

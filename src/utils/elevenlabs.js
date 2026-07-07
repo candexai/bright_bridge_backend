@@ -427,11 +427,27 @@ with "Did I get that correct?"
 
 "And could you please spell your email for me?"
 
-After parent spells email, read it back slowly, one character
-at a time:
+LISTEN — DO NOT INTERRUPT
+- Let the caller spell the ENTIRE address before you say anything.
+- Do not speak, read back, confirm, or move on while they are still
+  spelling.
+- Expect natural pauses between letters — a pause does NOT mean they
+  are finished. Wait until they have clearly stopped.
+- If there is a silence, keep waiting patiently. Never jump in with a
+  read-back before they finish.
 
+REQUIRE A COMPLETE ADDRESS
+A complete email has a name, the "@" symbol, and a domain ending
+(for example, gmail.com, yahoo.com, outlook.com, icloud.com).
+- If you did NOT clearly hear an "@" and a domain (the part after the
+  @), the address is incomplete. Ask ONE short follow-up before you
+  read anything back:
+  "Got it — and what comes after the @ symbol? For example, gmail dot com."
+- Do NOT read back or confirm an address that has no domain. Collecting
+  the domain this way is part of taking the email, not a second attempt.
+
+READ BACK (only once you have a full name@domain)
 Say: "Let me make sure I have that right…"
-
 Spell each character individually with a pause between each.
 Do not spell common domains character by character like
 @gmail.com, @yahoo.com, etc.
@@ -450,8 +466,10 @@ by phone."
 Mark email as not collected and proceed immediately to
 PRE-BOOKING CONFIRMATION.
 
-You get only ONE email attempt per call. Never ask the caller to
-spell their email a second time.
+You get only ONE read-back attempt per call. Asking for the domain when
+it was missing (above) is part of collecting the address, not a re-spell.
+Once you have read the address back, if the caller says it is wrong, do
+NOT ask them to spell it all over again — skip email and move on.
 
 Never block or delay the tour because email was not confirmed.
 The booking can still be completed without email.
@@ -676,7 +694,14 @@ async function createSchoolAgent(schoolName, knowledgeBaseId = null, toolIds = [
         console.log(`[Agent Create] Status: ${response.status}`);
         console.log(`[Agent Create] Data:`, JSON.stringify(response.data, null, 2));
 
-        return response.data?.agent_id || null;
+        const newAgentId = response.data?.agent_id || null;
+        if (newAgentId) {
+            // Best-effort: apply patient turn-taking so Nora waits during email/number spelling.
+            await patchAgentTurnConfig(newAgentId).catch((err) => {
+                console.warn('[Agent Create] turn config apply warning:', err.message);
+            });
+        }
+        return newAgentId;
     } catch (err) {
         console.error(`[Agent Create] Failed to create agent for ${schoolName}`);
         console.error(`[Agent Create] Error Status:`, err.response?.status);
@@ -1278,6 +1303,8 @@ async function patchAgentPromptContent(agentId, {
         label: 'admin first_message',
     });
 
+    await patchAgentTurnConfig(agentId, { branchId });
+
     const after = await fetchAgentSnapshot(agentId, 'AFTER patch', branchId);
     const beforeMsg = getAgentFirstMessage(before);
     const afterMsg = getAgentFirstMessage(after);
@@ -1348,6 +1375,8 @@ async function syncSchoolAgent(agentId, {
     });
     const patchResponse = { prompt: promptPatchResponse, firstMessage: firstMessagePatchResponse };
 
+    await patchAgentTurnConfig(agentId, { branchId });
+
     const transferResult = await patchAgentHumanTransfer(agentId, humanTransfer, { branchId });
     if (transferOn && !transferResult) {
         const err = new Error('Prompt saved but human transfer failed to sync to ElevenLabs (built_in_tools).');
@@ -1366,6 +1395,38 @@ async function syncSchoolAgent(agentId, {
     }
 
     return patchResponse;
+}
+
+/**
+ * Turn-taking config so Nora waits for callers to finish (esp. while spelling emails/numbers)
+ * instead of cutting them off. Applied most-preferred first; on a 400 (unsupported field on
+ * this API version) we fall back to progressively simpler configs so the safe settings still land.
+ */
+const TURN_CONFIG_ATTEMPTS = [
+    { turn_timeout: 12, turn_eagerness: 'patient' },
+    { turn_timeout: 12 },
+];
+
+async function patchAgentTurnConfig(agentId, { branchId = null, attempts = TURN_CONFIG_ATTEMPTS } = {}) {
+    const baseUrl = process.env.ELEVENLABS_API_URL;
+    if (!baseUrl || !agentId) {
+        return null;
+    }
+    const url = agentsUrlFor(baseUrl, agentId, branchId);
+    let lastErr = null;
+    for (const turn of attempts) {
+        try {
+            const response = await axios.patch(url, { conversation_config: { turn } }, { headers: elevenLabsHeaders() });
+            console.log('[Agent Turn] applied turn config:', JSON.stringify(turn));
+            return response.data;
+        } catch (err) {
+            lastErr = err;
+            if (err?.response?.status !== 400) break;
+            console.warn('[Agent Turn] turn config rejected, trying simpler config:', JSON.stringify(err?.response?.data || {}));
+        }
+    }
+    console.error('[Agent Turn] turn config patch failed:', lastErr?.response?.status, JSON.stringify(lastErr?.response?.data || {}));
+    return null;
 }
 
 async function patchAgentHumanTransfer(agentId, humanTransfer, { branchId = null } = {}) {
@@ -1451,6 +1512,7 @@ module.exports = {
     syncSchoolAgent,
     patchAgentPromptContent,
     patchAgentHumanTransfer,
+    patchAgentTurnConfig,
     normalizeToolIds,
     isToolsToolIdsConflict,
     formatQAPairsForKB,
