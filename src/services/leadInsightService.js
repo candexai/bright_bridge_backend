@@ -229,15 +229,7 @@ function wasEmailSkippedOrRejectedInTranscript(webhook, comprehensiveResult = nu
             if (inEmailFlow && EMAIL_RETRY_PATTERN.test(text)) {
                 awaitingConfirm = false;
             }
-            if (inEmailFlow && /what is your child'?s name/i.test(text) && rejections >= 2) {
-                return true;
-            }
-            if (
-                inEmailFlow
-                && /what is your child'?s name/i.test(text)
-                && rejections >= 1
-                && !/we(?:'|')?ll send your tour details to your email/i.test(agentText)
-            ) {
+            if (inEmailFlow && (/what is your child'?s name/i.test(text) || /just to confirm/i.test(text)) && rejections >= 1) {
                 return true;
             }
         }
@@ -247,7 +239,7 @@ function wasEmailSkippedOrRejectedInTranscript(webhook, comprehensiveResult = nu
             if (USER_EMAIL_NO_PATTERN.test(lower) || /\b(no|nope|wrong|incorrect)\b/i.test(lower)) {
                 rejections += 1;
                 awaitingConfirm = false;
-                if (rejections >= 2) return true;
+                if (rejections >= 1) return true;
             } else if (USER_EMAIL_YES_PATTERN.test(lower)) {
                 emailConfirmedInCall = true;
                 inEmailFlow = false;
@@ -258,7 +250,7 @@ function wasEmailSkippedOrRejectedInTranscript(webhook, comprehensiveResult = nu
     }
 
     if (emailConfirmedInCall) return false;
-    return rejections >= 2;
+    return rejections >= 1;
 }
 
 function resolveParentEmail(webhook, comprehensiveResult = null, options = {}) {

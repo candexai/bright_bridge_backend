@@ -290,22 +290,13 @@ router.get('/dashboard', async (req, res) => {
         const userToken = req.headers.authorization?.split(' ')[1] || '';
         const backendUrl = process.env.BACKEND_URL || `${req.protocol}://${req.get('host')}`;
 
-        const period = req.query.period || 'daily';
-        let periodMs;
-        let chartBars;
-        if (period === 'monthly') {
-            periodMs = 30 * 24 * 60 * 60 * 1000;
-            chartBars = 30;
-        } else if (period === 'weekly') {
-            periodMs = 7 * 24 * 60 * 60 * 1000;
-            chartBars = 7;
-        } else {
-            // daily
-            periodMs = 24 * 60 * 60 * 1000;
-            chartBars = 1; // show 24-hour bar chart (hourly)
+        const { resolveDashboardPeriod, isWithinPeriod, buildDashboardChartData } = require('../utils/dashboardPeriod');
+        const periodWindow = resolveDashboardPeriod(req.query);
+        if (periodWindow.error) {
+            return res.status(400).json({ error: periodWindow.error });
         }
-        const periodStart = new Date(Date.now() - periodMs);
-        console.log(`[DASHBOARD DEBUG] Handling period: ${period}, Start date: ${periodStart.toISOString()}`);
+        const { period, periodStart, periodEnd, chartBars, bucketType } = periodWindow;
+        console.log(`[DASHBOARD DEBUG] Handling period: ${period}, Start: ${periodStart.toISOString()}, End: ${periodEnd.toISOString()}`);
 
         const [
             adminEmails,
@@ -601,7 +592,7 @@ router.get('/dashboard', async (req, res) => {
         }
 
         // Filter calls to the selected period
-        const periodCalls = calls.filter(c => new Date(c.timestamp) >= periodStart);
+        const periodCalls = calls.filter((c) => isWithinPeriod(c.timestamp, periodStart, periodEnd));
         console.log(`[DASHBOARD DEBUG] Total calls: ${calls.length}, Period calls: ${periodCalls.length}`);
 
         // Calculate metrics from period calls
@@ -622,43 +613,13 @@ router.get('/dashboard', async (req, res) => {
         // Action Needed (Missed Tours / Needs Attention) - Period-based
         const actionNeeded = periodCalls.filter(c => !c.tourBookingDetected).length;
 
-        // Chart Data
-        const chartData = [];
-        const nowDate = new Date();
-
-        if (period === 'daily') {
-            // 24 hourly buckets
-            for (let i = 23; i >= 0; i--) {
-                const bucketEnd = new Date(nowDate.getTime() - i * 60 * 60 * 1000);
-                const bucketStart = new Date(bucketEnd.getTime() - 60 * 60 * 1000);
-                const bucketCalls = calls.filter(c => {
-                    const t = new Date(c.timestamp);
-                    return t >= bucketStart && t < bucketEnd;
-                });
-                chartData.push({
-                    name: bucketEnd.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false }),
-                    calls: bucketCalls.length
-                });
-            }
-        } else {
-            // Daily buckets for weekly (7) or monthly (30)
-            const todayAtMidnight = new Date();
-            todayAtMidnight.setHours(0, 0, 0, 0);
-            for (let i = chartBars - 1; i >= 0; i--) {
-                const day = new Date(todayAtMidnight);
-                day.setDate(day.getDate() - i);
-                const nextDay = new Date(day);
-                nextDay.setDate(day.getDate() + 1);
-                const dayCalls = calls.filter(c => {
-                    const t = new Date(c.timestamp);
-                    return t >= day && t < nextDay;
-                });
-                chartData.push({
-                    name: day.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
-                    calls: dayCalls.length
-                });
-            }
-        }
+        const chartData = buildDashboardChartData(calls, {
+            periodStart,
+            periodEnd,
+            bucketType,
+            chartBars,
+            period,
+        });
 
         const webhookLookup = buildWebhookLookup(schoolWebhooks);
         const insightMap = await resolveInsightsForWebhooks(schoolWebhooks, schoolObjectId, {
@@ -749,7 +710,7 @@ router.get('/dashboard', async (req, res) => {
                 { label: 'Action Needed', value: actionNeeded, icon: 'AlertTriangle' },
                 {
                     label: 'Tours Booked',
-                    value: actualToursBooked.filter(t => t.scheduledAt >= periodStart && Boolean(t.calendarProvider)).length,
+                    value: actualToursBooked.filter((t) => isWithinPeriod(t.scheduledAt, periodStart, periodEnd) && Boolean(t.calendarProvider)).length,
                     icon: 'Calendar'
                 },
                 { label: 'Minutes Consumed', value: `${allTimeMinutes} / ${totalMinutesCapacity}`, ticker: true, icon: 'Activity' },

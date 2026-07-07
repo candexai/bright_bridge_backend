@@ -39,7 +39,7 @@ Required fields to extract (set to null if not mentioned):
 
 3. parent_email
 
-- Set to null if the parent never provided a confirmed email, OR if the parent rejected Nora's email read-back twice and Nora skipped email (look for agent saying "tour details by phone" or moving on to child's name after email failures).
+- Set to null if the parent never provided a confirmed email, OR if the parent rejected Nora's email read-back and Nora skipped email (look for agent saying "tour details by phone" or moving on to name/phone confirmation after email failure).
 - Do NOT keep a rejected/unconfirmed email address in parent_email. Spoken forms like "name at gmail dot com" are NOT valid — use null unless the parent confirmed a real address (name@domain.com).
 
 4. child_name (array - supports siblings, e.g. ["Sid", "Maya"])
@@ -94,7 +94,7 @@ CONDITIONAL RULES - MANDATORY when conditions are met (apply ALL tags whose cond
 - "Urgency: Low" - MANDATORY if parent is just exploring (6+ months out)
 - "Price sensitive" - MANDATORY if parent asks about tuition, fees, or financial aid
 - "Tour requested" - MANDATORY if parent: explicitly asks for a tour OR expresses interest in booking a tour OR mentions wanting to visit the school OR discusses scheduling a tour OR agent offers to schedule a tour and parent engages with the offer
-- "Tour booked - email missing" - MANDATORY if tour_booked is true AND (parent_email is null/empty OR transcript shows Nora skipped email after two failed confirmations OR agent says "we will make sure you have your tour details by phone" / "tour details by phone" / similar)
+- "Tour booked - email missing" - MANDATORY if tour_booked is true AND (parent_email is null/empty OR transcript shows Nora skipped email after a failed confirmation OR agent says "we will make sure you have your tour details by phone" / "tour details by phone" / similar)
 - "Unknown" - MANDATORY if caller gave no enrollment details, asked no school-related questions, did not request a tour, and was not transferred as a current family. Use call_state "no_interaction" or when summary indicates no meaningful engagement.
 - "Follow-up needed" - MANDATORY if parent requests callback or additional information
 - "First-time parent" - MANDATORY if parent appears to be new to childcare enrollment or asks basic questions
