@@ -44,6 +44,44 @@ const CALLER_CURRENT_FAMILY_PATTERNS = [
     /\btransfer to\b/i,
 ];
 
+/** Caller explicitly said they are a new / prospective family. */
+const CALLER_NEW_FAMILY_PATTERNS = [
+    /^new family\.?\s*$/i,
+    /^nueva\.?\s*$/i,
+    /^familia nueva\.?\s*$/i,
+    /\b(?:i(?:'m| am)|we(?:'re| are))(?: a)? new family\b/i,
+    /\bnew family\b/i,
+    /\bfamilia nueva\b/i,
+    /\b(?:i(?:'m| am)|we(?:'re| are)) calling as a new family\b/i,
+    /\bprospective (?:family|parent)\b/i,
+];
+
+/**
+ * Caller wants a human at the school without identifying as a new family.
+ * In practice these are almost always current enrolled parents who skip the AI.
+ */
+const CALLER_HUMAN_ROUTING_PATTERNS = [
+    /\brepresentatives?\b/i,
+    /\bfront desk\b/i,
+    /\b(?:speak|talk)\s+(?:to|with)\s+(?:the\s+|a\s+)?(?:director|representative|front desk|someone|a\s+real\s+person)\b/i,
+    /\bconnect(?:ed)?\s+(?:me\s+)?(?:to\s+)?(?:someone|a\s+(?:real\s+)?person)\b/i,
+    /\bsomeone\s+(?:real|at the front desk)\b/i,
+    /\bneed\s+someone\s+(?:at\s+)?(?:the\s+)?front desk\b/i,
+];
+
+/** Non-parent callers — never classify as current family via routing heuristic. */
+const NON_PARENT_CALLER_PATTERNS = [
+    /\b(?:i(?:'m| am)|we(?:'re| are))\s+(?:a\s+)?teacher\b/i,
+    /\bcalling as a teacher\b/i,
+    /\bvendor\b/i,
+    /\bbusiness owner\b/i,
+    /\bemployment\b/i,
+    /\bemployee\b/i,
+    /\b(?:sand arts|wrong school|it'?s wrong)\b/i,
+    /\bneither\b.*\bemployee\b/i,
+    /\bemployee\b.*\bneither\b/i,
+];
+
 const ROUTING_ONLY_PATTERNS = [
     ...CALLER_CURRENT_FAMILY_PATTERNS,
     /^(hi|hello|hey|hola|yes|yeah|yep|ok|okay|no|thanks|thank you)\.?\s*$/i,
@@ -125,6 +163,39 @@ function callerIdentifiedAsCurrentFamily(callerText) {
         }
     }
     return false;
+}
+
+function callerIdentifiedAsNewFamily(callerText) {
+    const utterances = String(callerText || '').trim()
+        ? String(callerText).split(/\s*\|\s*|\n+/).map((line) => line.trim()).filter(Boolean)
+        : [];
+
+    for (const line of utterances) {
+        if (line.length > MAX_CALLER_UTTERANCE_CHARS || isPromptLeak(line)) continue;
+        if (CALLER_NEW_FAMILY_PATTERNS.some((pattern) => pattern.test(line))) {
+            return true;
+        }
+    }
+    const haystack = String(callerText || '');
+    return CALLER_NEW_FAMILY_PATTERNS.some((pattern) => pattern.test(haystack));
+}
+
+function callerWantsHumanRoutingOnly(callerText) {
+    const haystack = String(callerText || '').trim();
+    if (!haystack) return false;
+    if (callerIdentifiedAsNewFamily(haystack)) return false;
+    if (/\benroll(?:able|ment|ing)?\b/i.test(haystack)) return false;
+    if (callerIdentifiedAsCurrentFamily(haystack)) return true;
+    if (NON_PARENT_CALLER_PATTERNS.some((pattern) => pattern.test(haystack))) return false;
+    return CALLER_HUMAN_ROUTING_PATTERNS.some((pattern) => pattern.test(haystack));
+}
+
+function callerIdentifiedAsNewFamilyFromTranscript(transcriptArray) {
+    return callerIdentifiedAsNewFamily(getCallerUtterances(transcriptArray).join('\n'));
+}
+
+function callerWantsHumanRoutingOnlyFromTranscript(transcriptArray) {
+    return callerWantsHumanRoutingOnly(getCallerUtterances(transcriptArray).join('\n'));
 }
 
 function callerIdentifiedAsCurrentFamilyFromTranscript(transcriptArray) {
@@ -308,6 +379,10 @@ function resolveWebhookSummary(webhook) {
         return buildCurrentFamilyTransferResult(transcript).summary;
     }
 
+    if (callerWantsHumanRoutingOnlyFromTranscript(transcript)) {
+        return buildCurrentFamilyTransferResult(transcript).summary;
+    }
+
     // The extractor flagged this as a current family (guarded tag). Keep a proper
     // current-family summary instead of rewriting it to "No meaningful interaction".
     if (currentFamilyTagged) {
@@ -346,6 +421,10 @@ module.exports = {
     getCallerTextFromTranscript,
     getAgentTextFromTranscript,
     callerIdentifiedAsCurrentFamily,
+    callerIdentifiedAsNewFamily,
+    callerWantsHumanRoutingOnly,
+    callerIdentifiedAsNewFamilyFromTranscript,
+    callerWantsHumanRoutingOnlyFromTranscript,
     isCurrentFamilyTransferCall,
     isCurrentFamilyCall,
     agentConfirmedCurrentFamily,

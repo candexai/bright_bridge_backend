@@ -2,7 +2,7 @@ const crypto = require('crypto');
 const LeadInsight = require('../models/LeadInsight');
 const { extractTourDetails, mergeParentQuestionsFromExtraction, filterSchoolQuestions } = require('../utils/openai');
 const { getCallerPhoneFromWebhook, getCallDurationSeconds, getCallerNameFromWebhook } = require('../utils/webhookHelpers');
-const { resolveWebhookSummary, resolveCachedSummary, isNoMeaningfulInteractionSummary, isCurrentFamilyCall } = require('../utils/currentFamilyTransfer');
+const { resolveWebhookSummary, resolveCachedSummary, isNoMeaningfulInteractionSummary, isCurrentFamilyCall, callerIdentifiedAsCurrentFamily, callerIdentifiedAsNewFamily, callerWantsHumanRoutingOnly, callerIdentifiedAsNewFamilyFromTranscript, callerWantsHumanRoutingOnlyFromTranscript } = require('../utils/currentFamilyTransfer');
 
 /** New-parent enrollment / tour intent — word boundaries so "enrolled" does not match. */
 const NEW_PARENT_INTENT_PATTERNS = [
@@ -417,40 +417,6 @@ function detectHotLead({
     return true;
 }
 
-// Reliable current/existing-family self-identification only. Generic human-routing
-// ("front desk", "representative", "talk to the director") is intentionally excluded —
-// new families ask for a human too — and is instead covered by the guarded LLM tag.
-const CALLER_CURRENT_FAMILY_PATTERNS = [
-    /^currents?\.?$/i,
-    /^current family\.?$/i,
-    /\b(i(?:'m| am)|we(?:'re| are))(?: a)? current family\b/i,
-    /\bcurrent family\b/i,
-    /\bcurrent(?:ly)? enrolled\b/i,
-    /\benrolled family\b/i,
-    /\b(i(?:'m| am)|we(?:'re| are))(?: an?)? enrolled\b/i,
-    /\balready enrolled\b/i,
-    /\bexisting (?:family|parent)\b/i,
-    /\balready go(?:es)? (?:there|here)\b/i,
-    /\bfamilia actual\b/i,
-    /\bfamilia inscrita\b/i,
-    /\b(?:ya\s+)?(?:est[aá]\s+)?inscrit[oa]s?\b/i,
-    /^front desk\??$/i,
-];
-
-function callerIdentifiedAsCurrentFamily(callerText) {
-    const callerHaystack = String(callerText || '').toLowerCase().trim();
-    if (!callerHaystack) return false;
-
-    const callerLines = callerHaystack.split(/\s*\|\s*|\n+/).map((line) => line.trim()).filter(Boolean);
-    for (const line of callerLines) {
-        if (CALLER_CURRENT_FAMILY_PATTERNS.some((pattern) => pattern.test(line))) {
-            return true;
-        }
-    }
-
-    return CALLER_CURRENT_FAMILY_PATTERNS.some((pattern) => pattern.test(callerHaystack));
-}
-
 function agentTriggeredCurrentFamilyTransfer(agentText) {
     const agentHaystack = String(agentText || '').toLowerCase();
     if (!agentHaystack) return false;
@@ -495,6 +461,25 @@ function hasCapturedEnrollmentData({ childName = '', childAge = '', comprehensiv
     return false;
 }
 
+function hasMeaningfulCallerEngagement(callerText, comprehensiveResult = null) {
+    const substantive = String(callerText || '')
+        .split(/\s*\|\s*|\n+/)
+        .map((line) => line.trim())
+        .filter((line) => line && line.length > 2 && !/^\.{2,}$/.test(line)
+            && !/^(hi|hello|hey|hola|yes|no|okay|ok|thanks|thank you|buenos d[ií]as)\.?$/i.test(line));
+
+    if (substantive.length >= 2) return true;
+    if (callerIdentifiedAsNewFamily(callerText)) return true;
+    if (callerIdentifiedAsCurrentFamily(callerText)) return true;
+    if (callerWantsHumanRoutingOnly(callerText)) return true;
+
+    const summary = String(comprehensiveResult?.summary || '');
+    if (/identified as a (?:new|current)(?: enrolled)? family/i.test(summary)) return true;
+    if (comprehensiveResult?.call_state === 'partial') return true;
+
+    return substantive.length >= 1;
+}
+
 function isUnknownCall({
     tags = [],
     summary = '',
@@ -506,7 +491,13 @@ function isUnknownCall({
     tourBooked = false,
 } = {}) {
     if (tourBooked) return false;
-    if (comprehensiveResult?.call_state === 'no_interaction') return true;
+    if (callerIdentifiedAsNewFamily(callerText)) return false;
+    if (callerIdentifiedAsCurrentFamily(callerText)) return false;
+    if (callerWantsHumanRoutingOnly(callerText)) return false;
+
+    if (comprehensiveResult?.call_state === 'no_interaction' && !hasMeaningfulCallerEngagement(callerText, comprehensiveResult)) {
+        return true;
+    }
 
     const summaryText = String(summary || '');
     if (isNoMeaningfulInteractionSummary(summaryText)) return true;
@@ -554,6 +545,28 @@ function detectParentSegment(tags, summary, webhookOrCallerText, options = {}) {
     const tagList = Array.isArray(tags) ? tags : [];
     const hasCurrentFamilyTag = tagList.some((t) => String(t).trim().toLowerCase() === 'current family');
     if (hasCurrentFamilyTag && comprehensiveResult?.call_state !== 'no_interaction') {
+        return 'current_family';
+    }
+
+    // Explicit new-family self-identification (e.g. "New family", "Nueva").
+    if (webhook?.transcript && callerIdentifiedAsNewFamilyFromTranscript(webhook.transcript)) {
+        return 'new_parent';
+    }
+    if (callerIdentifiedAsNewFamily(callerText)) {
+        return 'new_parent';
+    }
+    if (/identified as a new family/i.test(String(summary || ''))) {
+        return 'new_parent';
+    }
+    if (/\benroll(?:able|ment|ing)?\b/i.test(callerText) && !callerIdentifiedAsCurrentFamily(callerText)) {
+        return 'new_parent';
+    }
+
+    // Parents who only ask for a representative/director/front desk (never said "new family").
+    if (webhook?.transcript && callerWantsHumanRoutingOnlyFromTranscript(webhook.transcript)) {
+        return 'current_family';
+    }
+    if (callerWantsHumanRoutingOnly(callerText)) {
         return 'current_family';
     }
 
