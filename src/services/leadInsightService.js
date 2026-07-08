@@ -372,6 +372,91 @@ function hasSchoolKbInquiry({
     return getCallerSchoolQuestions(callerText).length > 0;
 }
 
+/** Enrollment-urgency values (from the extractor) that signal a ready-to-convert lead. */
+const STRONG_ENROLLMENT_URGENCY = new Set(['immediate', 'within weeks', 'specific month']);
+
+// Near-term / urgent enrollment target phrasing (a concrete soon-ish intent). Deliberately
+// excludes far-future intent like "next year" / "in the fall of next year" so those stay warm.
+const NEAR_TERM_TARGET_PATTERN = /\b(asap|as soon as possible|immediate(?:ly)?|right away|this (?:week|month)|next (?:week|month)|within (?:a |the |the next )?(?:week|month|weeks|few weeks|couple (?:of )?weeks)|january|february|march|april|may|june|july|august|september|october|november|december)\b/i;
+
+// Explicit enrollment intent the parent voices (scanned against parent-sourced text only).
+const ENROLLMENT_INTENT_PATTERNS = [
+    /\benroll(?:ing|ment)?\b/i,
+    /\bregist(?:er|ration|ering)\b/i,
+    /\bsign(?:ing)?\s+(?:my|our|him|her|them|the kids?)?\s*up\b/i,
+    /\badmission\b/i,
+    /\bapply(?:ing)?\b|\bapplication\b/i,
+    /\bget (?:my|our|the|a|him|her|them) (?:child|kid|son|daughter|children|little one|baby|twins)\b.{0,25}\b(?:in|into|enrolled|started|spot|place|going)\b/i,
+    /\b(?:a )?(?:spot|space|opening|slot|place|seat|waitlist)\b.{0,25}\b(?:for|available|open)\b/i,
+    /\b(?:do you have|is there|are there)\b.{0,25}\b(?:spot|space|opening|slot|availab|room|capacity|waitlist)\b/i,
+    /\blooking (?:for|to|at)\b.{0,30}\b(?:care|daycare|childcare|preschool|enroll|program|school|spot|placement)\b/i,
+    /\b(?:need|want|interested in|hoping)\b.{0,30}\b(?:enroll|daycare|childcare|care for|preschool|a spot|placement|start)\b/i,
+    /\bstart(?:ing)?\b.{0,20}\b(?:school|daycare|program|care|next)\b/i,
+    /\bplace for (?:my|our)\b/i,
+];
+
+// Tour interest the parent voices (booked, requested, or wants to visit/see the school).
+const TOUR_INTENT_PATTERNS = [
+    /\btour\b/i,
+    /\b(?:come|schedule|book|set up|arrange|plan)\b.{0,20}\b(?:visit|tour|see|look)\b/i,
+    /\bvisit (?:the )?(?:school|center|centre|facility|campus|place|daycare)\b/i,
+    /\bsee (?:the )?(?:school|classroom|facility|place|center|centre)\b/i,
+    /\bcome (?:in|by|and see|take a look|check)\b/i,
+    /\bwalk[\s-]?(?:in|through)\b/i,
+];
+
+/**
+ * A prospective family shows strong buying intent when they booked a tour, the extractor flagged
+ * an immediate/soon urgency, or they named a concrete near-term enrollment date — even if they
+ * didn't ask specific school/KB questions. This is what makes someone like Leslie (wants to
+ * enroll two kids by "August 17th") a hot lead, while a "next year" caller stays warm.
+ */
+function hasStrongEnrollmentIntent({ comprehensiveResult = null, tags = [], tourBooked = false } = {}) {
+    if (tourBooked) return true;
+
+    const cr = comprehensiveResult || {};
+    const urgency = String(cr.enrollment_urgency || '').toLowerCase().trim();
+    if (STRONG_ENROLLMENT_URGENCY.has(urgency)) return true;
+
+    const targetDate = String(cr.enrollment_target_date || '').trim();
+    if (targetDate && NEAR_TERM_TARGET_PATTERN.test(targetDate) && !/\bnext year\b/i.test(targetDate)) {
+        return true;
+    }
+
+    const tagHaystack = (Array.isArray(tags) ? tags : []).join(' ').toLowerCase();
+    if (/urgency:\s*(?:immediate|high)/i.test(tagHaystack)) return true;
+    if (/\btour (?:requested|booked)\b/i.test(tagHaystack)) return true;
+
+    return false;
+}
+
+/**
+ * Parent-voiced enrollment or tour intent, scanned against parent-sourced text (their own words,
+ * the questions they asked, and their topics of interest) — never the agent's summary, to avoid
+ * agent boilerplate ("offered a tour") creating false positives.
+ */
+function hasEnrollmentOrTourIntent({ callerText = '', questionsAsked = [], comprehensiveResult = null } = {}) {
+    const topics = Array.isArray(comprehensiveResult?.topics_of_interest)
+        ? comprehensiveResult.topics_of_interest.join(' ')
+        : '';
+    const haystack = `${callerText} ${(questionsAsked || []).join(' ')} ${topics}`.trim();
+    if (!haystack) return false;
+    if (ENROLLMENT_INTENT_PATTERNS.some((pattern) => pattern.test(haystack))) return true;
+    if (TOUR_INTENT_PATTERNS.some((pattern) => pattern.test(haystack))) return true;
+    return false;
+}
+
+/**
+ * HOT LEAD = a genuinely interested caller worth prioritizing. For a prospective (new) family
+ * this fires on ANY real buying signal:
+ *   1. A school/knowledge-base question (tuition, hours, meals, ratio, curriculum, safety,
+ *      availability/waitlist, age groups, etc.)
+ *   2. A tour — booked, requested, or an expressed wish to visit/see the school
+ *   3. Enrollment intent — wants to enroll/register/sign up, asks about a spot/opening, or a
+ *      concrete near-term timeframe (immediate / within weeks / specific month / a named date)
+ * A current family is hot only when it raises a substantive service question. Empty, no-interaction,
+ * unknown, and non-parent (teacher/vendor/employment) calls are never hot.
+ */
 function detectHotLead({
     tags = [],
     summary = '',
@@ -380,41 +465,33 @@ function detectHotLead({
     questionsAsked = [],
     missingDetails = [],
     comprehensiveResult = null,
+    tourBooked = false,
 } = {}) {
     const summaryText = String(summary || '').toLowerCase();
-    const schoolInquiry = hasSchoolKbInquiry({ questionsAsked, callerText, comprehensiveResult });
 
     if (/no meaningful interaction|did not engage|call was interrupted|caller did not/i.test(summaryText)) {
         return false;
-    }
-
-    // Partial / early hang-ups with no school questions are not hot leads.
-    // Callers who asked about tuition, programs, meals, etc. still qualify even if
-    // the call ended before all contact details were collected (e.g. Arjun).
-    if (!schoolInquiry) {
-        if (
-            /ended before any additional information|before any .{0,40}(?:could be )?collected/i.test(summaryText)
-            || /no questions (?:were )?asked/i.test(summaryText)
-            || /call ended before/i.test(summaryText)
-        ) {
-            return false;
-        }
     }
 
     if (parentSegment === 'unknown') {
         return false;
     }
 
-    if (!schoolInquiry) {
-        return false;
-    }
+    const schoolInquiry = hasSchoolKbInquiry({ questionsAsked, callerText, comprehensiveResult });
 
+    // Current families are hot only when they raise a substantive service question.
     if (parentSegment === 'current_family') {
+        if (!schoolInquiry) return false;
         const inquiryHaystack = `${callerText} ${filterSchoolQuestions(questionsAsked).join(' ')}`.trim();
         return CURRENT_FAMILY_INQUIRY_PATTERNS.some((pattern) => pattern.test(inquiryHaystack));
     }
 
-    return true;
+    // Prospective (new) families: hot on any real buying signal.
+    if (schoolInquiry) return true;
+    if (hasStrongEnrollmentIntent({ comprehensiveResult, tags, tourBooked })) return true;
+    if (hasEnrollmentOrTourIntent({ callerText, questionsAsked, comprehensiveResult })) return true;
+
+    return false;
 }
 
 function agentTriggeredCurrentFamilyTransfer(agentText) {
@@ -691,6 +768,7 @@ function mapInsightFields(webhook, { tags = [], comprehensiveResult = null, summ
         questionsAsked,
         missingDetails,
         comprehensiveResult,
+        tourBooked,
     });
 
     return applyTagPostProcessing({
@@ -754,6 +832,7 @@ function sanitizeCachedInsight(doc, webhook = null) {
         questionsAsked,
         missingDetails,
         comprehensiveResult: webhook?.comprehensive_result || null,
+        tourBooked: doc.tourBooked ?? (webhook ? isTourBooked(webhook, webhook?.comprehensive_result) : false),
     });
     return {
         tags: enrichTags(tags.filter((t) => t.toLowerCase() !== 'hot lead'), isHotLead, parentSegment),

@@ -87,7 +87,7 @@ FAIL-SAFE RULES - Apply these ALWAYS, no exceptions:
 
 CONDITIONAL RULES - MANDATORY when conditions are met (apply ALL tags whose conditions are satisfied):
 
-- "Hot lead" - MANDATORY ONLY if the parent explicitly asked about school/KB topics (tuition, hours, programs, meals, teacher ratio, curriculum, etc.). NEVER apply for partial calls, calls that ended before collecting details, tour-only booking with no school questions, or when the caller only gave their name.
+- "Hot lead" - MANDATORY for a prospective/new family when ANY of these is true: (a) the parent explicitly asked about school/KB topics (tuition, hours, programs, meals, teacher ratio, curriculum, etc.), OR (b) the parent booked or requested a tour, OR (c) the parent expressed concrete enrollment intent — an enrollment_urgency of "immediate", "within weeks", or "specific month", or a specific enrollment_target_date (e.g. "August 17th", "next month", "as soon as possible"). Apply this even if the call ended before all contact details were collected. Do NOT apply when the caller only gave their name with no intent, hung up immediately, had no meaningful interaction, or is a non-parent (teacher, vendor, employment, wrong number).
 - "Urgency: Immediate" - MANDATORY if parent needs enrollment ASAP (e.g., "starting next week", "as soon as possible", "immediate")
 - "Urgency: High" - MANDATORY if parent needs enrollment soon (within 1-2 months)
 - "Urgency: Medium" - MANDATORY if parent is planning ahead (3-6 months)
