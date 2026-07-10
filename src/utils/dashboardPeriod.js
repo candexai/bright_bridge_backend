@@ -3,6 +3,8 @@ const PRESET_DAYS = {
     '7d': 7,
     '15d': 15,
     '30d': 30,
+    '60d': 60,
+    '90d': 90,
     daily: 1,
     weekly: 7,
     monthly: 30,
@@ -28,11 +30,23 @@ function parseDateInput(value) {
 
 /**
  * Resolve dashboard date window from query params.
- * Supports presets (1d, 7d, 15d, 30d) and custom startDate/endDate (YYYY-MM-DD).
+ * Supports presets (1d, 7d, 15d, 30d, 60d, 90d, all) and custom startDate/endDate (YYYY-MM-DD).
  */
 function resolveDashboardPeriod(query = {}) {
     const period = String(query.period || '30d').trim().toLowerCase();
     const now = new Date();
+
+    if (period === 'all') {
+        const periodStart = parseDateInput(query.startDate) || new Date(0);
+        return {
+            period: 'all',
+            periodStart: startOfDay(periodStart),
+            periodEnd: now,
+            chartBars: 30,
+            bucketType: 'daily',
+            daySpan: Math.max(1, Math.floor((now - periodStart) / (24 * 60 * 60 * 1000)) + 1),
+        };
+    }
 
     if (period === 'custom') {
         const start = parseDateInput(query.startDate);

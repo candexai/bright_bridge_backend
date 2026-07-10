@@ -14,6 +14,7 @@ const InquirySubmission = require('../models/InquirySubmission');
 const TourBooking = require('../models/TourBooking');
 const MinuteLedger = require('../models/MinuteLedger');
 const ElevenLabsWebhook = require('../models/ElevenLabsWebhook');
+const LeadInsight = require('../models/LeadInsight');
 const voiceAISchema = require('../models/VoiceAI');
 const AiNumberRequest = require('../models/AiNumberRequest');
 const { authMiddleware, schoolOnly } = require('../middleware/auth');
@@ -40,6 +41,9 @@ const {
     isTourBooked,
     isTourBookedEmailMissing,
     isValidConfirmedEmail,
+    withPastCallNameTag,
+    buildCallerNameHistoryIndex,
+    resolveCallerNameWithPastFallback,
 } = require('../services/leadInsightService');
 const {
     formatQAPairsForKB,
@@ -307,6 +311,7 @@ router.get('/dashboard', async (req, res) => {
             connectedCalendarCount,
             latestPaidPlanTx,
             minuteGrantTotals,
+            insightNameRows,
         ] = await Promise.all([
             Followup.find(adminEmailQuery)
                 .sort({ createdAt: -1 })
@@ -420,34 +425,49 @@ router.get('/dashboard', async (req, res) => {
                     },
                 },
             ]),
+            LeadInsight.find({ schoolId: schoolObjectId })
+                .select('callerPhone callerName callTimestamp webhookId')
+                .lean(),
         ]);
         const hasConnectedCalendar = connectedCalendarCount > 0;
 
-        // Lookup map for parent names based on normalized phone numbers
-        const parentNameMap = new Map();
-        const addParentName = (phone, name) => {
-            if (!isRealPhoneForLookup(phone)) return;
-            if (!isUsableCallerName(name)) return;
-            const normalized = normalizePhone(phone);
-            if (normalized) parentNameMap.set(normalized, String(name).trim());
-        };
+        // Lookup map for parent names based on normalized phone numbers (chronological)
+        const nameHistoryIndex = buildCallerNameHistoryIndex([
+            ...actualToursBooked.map((tour) => ({
+                phone: tour.phone,
+                name: tour.parentName,
+                timestamp: tour.scheduledAt,
+            })),
+            ...schoolWebhooks.map((wh) => ({
+                phone: getCallerPhoneFromWebhook(wh, ''),
+                name: getCallerNameFromWebhook(wh, null),
+                timestamp: wh.metadata?.start_time_unix_secs
+                    ? wh.metadata.start_time_unix_secs * 1000
+                    : wh.received_at,
+                webhookId: wh._id,
+            })),
+            ...callLogEntries.map((cl) => ({
+                phone: cl.from_phone_number,
+                name: cl.callerName,
+                timestamp: cl.createdAt,
+                webhookId: cl._id,
+            })),
+            ...insightNameRows.map((row) => ({
+                phone: row.callerPhone,
+                name: row.callerName,
+                timestamp: row.callTimestamp,
+                webhookId: row.webhookId,
+            })),
+        ]);
 
-        actualToursBooked.forEach(tour => addParentName(tour.phone, tour.parentName));
-        schoolWebhooks.forEach(wh => {
-            const callerPhone = getCallerPhoneFromWebhook(wh, '');
-            const callerName = getCallerNameFromWebhook(wh, null);
-            addParentName(callerPhone, callerName);
-        });
-        callLogEntries.forEach(cl => addParentName(cl.from_phone_number, cl.callerName));
-
-        const resolveName = (phone, specificName = null) => {
-            if (isUsableCallerName(specificName)) return String(specificName).trim();
-            if (isWidgetCallerId(phone)) return 'Unknown Caller';
-            const normalized = normalizePhone(phone);
-            if (!isRealPhoneForLookup(phone)) return 'Parent';
-            const fromMap = parentNameMap.get(normalized);
-            if (isUsableCallerName(fromMap)) return fromMap;
-            return 'Parent';
+        const resolveName = (phone, specificName = null, callTimestamp = null, webhookId = null) => {
+            const resolved = resolveCallerNameWithPastFallback(nameHistoryIndex, {
+                callerName: specificName,
+                callerPhone: phone,
+                callTimestamp,
+                webhookId,
+            });
+            return resolved;
         };
 
         adminEmailNotifications = adminEmails.map(email => ({
@@ -467,15 +487,19 @@ router.get('/dashboard', async (req, res) => {
 
             // Only show "Tour booked" on dashboard when school has a connected calendar.
             const bookingConfirmed = hasConnectedCalendar && Boolean(wh.tour_booking_detected);
+            const identity = resolveName(
+                getCallerPhoneFromWebhook(wh, ''),
+                getCallerNameFromWebhook(wh, null),
+                callTimestamp,
+                wh._id
+            );
 
             return {
                 id: wh._id.toString(),
                 conversationId: wh.conversation_id,
                 callerPhone: getCallerPhoneFromWebhook(wh, 'Web Widget'),
-                callerName: resolveName(
-                    getCallerPhoneFromWebhook(wh, ''),
-                    getCallerNameFromWebhook(wh, null)
-                ),
+                callerName: identity.callerName,
+                usedPastCallName: identity.usedPastCallName,
                 duration: getCallDurationSeconds(wh),
                 timestamp: callTimestamp,
                 recordingUrl: `${backendUrl}/api/school/calls/${wh.conversation_id}/audio?token=${userToken}`,
@@ -487,11 +511,14 @@ router.get('/dashboard', async (req, res) => {
             };
         });
 
-        const callLogCalls = callLogEntries.map(cl => ({
+        const callLogCalls = callLogEntries.map(cl => {
+            const identity = resolveName(cl.from_phone_number || '', cl.callerName, cl.createdAt, cl._id);
+            return {
             id: cl._id.toString(),
             conversationId: cl.conversation_id,
             callerPhone: cl.from_phone_number || 'Unknown',
-            callerName: resolveName(cl.from_phone_number || '', cl.callerName),
+            callerName: identity.callerName,
+            usedPastCallName: identity.usedPastCallName,
             duration: cl.duration || 0,
             timestamp: cl.createdAt,
             recordingUrl: cl.conversation_id ? `${backendUrl}/api/school/calls/${cl.conversation_id}/audio?token=${userToken}` : null,
@@ -500,7 +527,8 @@ router.get('/dashboard', async (req, res) => {
             tourBookingDetected: false, // Tour booking handled via separate collection
             tourBookingDate: null,
             aiProcessed: true
-        }));
+        };
+        });
 
         // ── STEP 3: Merge and Deduplicate ──────────
         const allCallsMap = new Map();
@@ -549,10 +577,14 @@ router.get('/dashboard', async (req, res) => {
         });
 
         const calls = Array.from(allCallsMap.values())
-            .map(c => ({
-                ...c,
-                callerName: resolveName(c.callerPhone, c.callerName),
-            }))
+            .map(c => {
+                const identity = resolveName(c.callerPhone, c.callerName, c.timestamp, c.id);
+                return {
+                    ...c,
+                    callerName: identity.callerName,
+                    usedPastCallName: Boolean(c.usedPastCallName || identity.usedPastCallName),
+                };
+            })
             .sort((a, b) =>
                 new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
             );
@@ -595,34 +627,9 @@ router.get('/dashboard', async (req, res) => {
         const periodCalls = calls.filter((c) => isWithinPeriod(c.timestamp, periodStart, periodEnd));
         console.log(`[DASHBOARD DEBUG] Total calls: ${calls.length}, Period calls: ${periodCalls.length}`);
 
-        // Calculate metrics from period calls
-        const totalCalls = periodCalls.length;
-        const totalDurationSeconds = periodCalls.reduce((acc, c) => acc + (c.duration || 0), 0);
-
-        // ALL-TIME Minutes (usage tracker - never "resets" due to limited query windows)
-        // IMPORTANT: We must compute this from the same merged/deduped `calls` array used for
-        // the other dashboard metrics; summing only `CallLog` can undercount when some calls
-        // only exist in VoiceAI (benny) and/or ElevenLabs webhooks.
-        const allTimeDurationSeconds = calls.reduce((acc, c) => acc + (Number(c.duration) || 0), 0);
-        const allTimeMinutes = Math.floor(allTimeDurationSeconds / 60);
-
-        // Average Call Length (Period-based)
-        const avgCallLengthSeconds = totalCalls > 0 ? Math.round(totalDurationSeconds / totalCalls) : 0;
-        const avgCallLengthFormatted = `${Math.floor(avgCallLengthSeconds / 60)}m ${avgCallLengthSeconds % 60}s`;
-
-        // Action Needed (Missed Tours / Needs Attention) - Period-based
-        const actionNeeded = periodCalls.filter(c => !c.tourBookingDetected).length;
-
-        const chartData = buildDashboardChartData(calls, {
-            periodStart,
-            periodEnd,
-            bucketType,
-            chartBars,
-            period,
-        });
-
         const webhookLookup = buildWebhookLookup(schoolWebhooks);
-        const insightMap = await resolveInsightsForWebhooks(schoolWebhooks, schoolObjectId, {
+        // Warm insight resolution for webhooks (segment/tags used by KPIs + recent calls).
+        await resolveInsightsForWebhooks(schoolWebhooks, schoolObjectId, {
             allowOpenAI: false,
             persist: false,
         });
@@ -680,11 +687,63 @@ router.get('/dashboard', async (req, res) => {
             return isTourBookedEmailMissing(wh);
         };
 
+        const hasCallbackRequestTag = (tags = []) =>
+            tags.some((tag) => {
+                const lower = String(tag).toLowerCase();
+                return (
+                    lower.includes('parent requested callback')
+                    || lower.includes('callback requested')
+                    || lower.includes('callback')
+                    || lower.includes('call back')
+                );
+            });
+
+        // Calculate metrics from period calls
+        const totalCalls = periodCalls.length;
+
+        // ALL-TIME Minutes — new parents only (enrollment usage, not current family / unknown)
+        // IMPORTANT: We must compute this from the same merged/deduped `calls` array used for
+        // the other dashboard metrics; summing only `CallLog` can undercount when some calls
+        // only exist in VoiceAI (benny) and/or ElevenLabs webhooks.
+        const newParentCalls = calls.filter((c) => resolveCallParentSegment(c) === 'new_parent');
+        const allTimeDurationSeconds = newParentCalls.reduce((acc, c) => acc + (Number(c.duration) || 0), 0);
+        const allTimeMinutes = Math.floor(allTimeDurationSeconds / 60);
+
+        // Average Call Length — new parents only (period-based)
+        const periodNewParentCalls = periodCalls.filter((c) => resolveCallParentSegment(c) === 'new_parent');
+        const newParentDurationSeconds = periodNewParentCalls.reduce((acc, c) => acc + (Number(c.duration) || 0), 0);
+        const avgCallLengthSeconds = periodNewParentCalls.length > 0
+            ? Math.round(newParentDurationSeconds / periodNewParentCalls.length)
+            : 0;
+        const avgCallLengthFormatted = `${Math.floor(avgCallLengthSeconds / 60)}m ${avgCallLengthSeconds % 60}s`;
+
+        // Action Needed: new parents (+ callback requests) that still need follow-up.
+        // Exclude unknown / current family. Exclude tour-booked calls unless email is missing
+        // (same eligibility as Daily Insights Action Needed / LeadInsight.actionNeededEligible).
+        // New Parent filter on Recent Calls can still include tour-booked parents.
+        const actionNeeded = periodCalls.filter((c) => {
+            const segment = resolveCallParentSegment(c);
+            if (segment === 'unknown' || segment === 'current_family') return false;
+            const tags = resolveCallTags(c);
+            if (!(segment === 'new_parent' || hasCallbackRequestTag(tags))) return false;
+            if (c.tourBookingDetected && !resolveCallTourEmailMissing(c, tags)) return false;
+            return true;
+        }).length;
+
+        const chartData = buildDashboardChartData(calls, {
+            periodStart,
+            periodEnd,
+            bucketType,
+            chartBars,
+            period,
+        });
+
         // Recent calls: top 20 within selected period
         const recentCalls = periodCalls
             .slice(0, 20)
             .map(c => {
-                const tags = resolveCallTags(c);
+                let tags = resolveCallTags(c);
+                if (c.usedPastCallName) tags = withPastCallNameTag(tags);
                 return {
                 id: c.id,
                 conversationId: c.conversationId || null,
@@ -723,6 +782,523 @@ router.get('/dashboard', async (req, res) => {
         });
     } catch (err) {
         console.error('School dashboard error:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// GET /api/school/recent-calls — all calls in a date range (no top-N / 500 caps), with parent tags
+router.get('/recent-calls', async (req, res) => {
+    try {
+        const schoolId = req.user.schoolId;
+        if (!schoolId) {
+            return res.status(400).json({ error: 'No school associated with this user' });
+        }
+
+        const schoolObjectId = new mongoose.Types.ObjectId(schoolId);
+        const school = await School.findById(schoolId)
+            .select('aiNumber aiNumberAssignedAt')
+            .lean();
+
+        const { resolveDashboardPeriod, isWithinPeriod } = require('../utils/dashboardPeriod');
+        const periodWindow = resolveDashboardPeriod(req.query);
+        if (periodWindow.error) {
+            return res.status(400).json({ error: periodWindow.error });
+        }
+        const { period, periodStart, periodEnd } = periodWindow;
+
+        const normalizePhone = (phone) => {
+            if (!phone) return '';
+            return phone.replace(/\D/g, '');
+        };
+
+        const phoneKey = (phone) => {
+            const digits = normalizePhone(phone);
+            if (digits.length >= 10) return digits.slice(-10);
+            return digits.length >= 7 ? digits : '';
+        };
+
+        const toOrdinal = (n) => {
+            const num = Number(n) || 0;
+            const mod100 = num % 100;
+            if (mod100 >= 11 && mod100 <= 13) return `${num}th`;
+            switch (num % 10) {
+                case 1: return `${num}st`;
+                case 2: return `${num}nd`;
+                case 3: return `${num}rd`;
+                default: return `${num}th`;
+            }
+        };
+
+        const userToken = req.headers.authorization?.split(' ')[1] || '';
+        const backendUrl = process.env.BACKEND_URL || `${req.protocol}://${req.get('host')}`;
+        const schoolAiNumber = normalizePhone(school?.aiNumber || '');
+        const startUnix = Math.floor(periodStart.getTime() / 1000);
+        const endUnix = Math.floor(periodEnd.getTime() / 1000);
+
+        const [schoolWebhooks, callLogEntries, connectedCalendarCount, voiceAiCalls, cachedInsights, phoneHistoryRows, allWebhookMeta] = await Promise.all([
+            ElevenLabsWebhook.find({
+                type: 'post_call_transcription',
+                schoolId: schoolObjectId,
+                $or: [
+                    { received_at: { $gte: periodStart, $lte: periodEnd } },
+                    {
+                        'metadata.start_time_unix_secs': {
+                            $gte: startUnix,
+                            $lte: endUnix,
+                        },
+                    },
+                ],
+            })
+                .select('-raw_payload -audio_base64')
+                .sort({ received_at: -1 })
+                .lean(),
+            CallLog.find({
+                schoolId: schoolObjectId,
+                createdAt: { $gte: periodStart, $lte: periodEnd },
+            })
+                .sort({ createdAt: -1 })
+                .lean(),
+            Integration.countDocuments({
+                schoolId,
+                connected: true,
+                type: { $in: ['google', 'outlook'] },
+            }),
+            (async () => {
+                if (!schoolAiNumber) return [];
+                try {
+                    const digits = schoolAiNumber;
+                    const normalizedNumber = `+${digits}`;
+                    const participantId = `sip_${normalizedNumber}`;
+                    const bennyDb = mongoose.connection.useDb('benny');
+                    const collection = bennyDb.collection('voiceAI');
+                    const timeFilter = {
+                        $or: [
+                            { created_at: { $gte: periodStart, $lte: periodEnd } },
+                            { timestamp: { $gte: periodStart, $lte: periodEnd } },
+                        ],
+                    };
+                    let voiceAiQuery = {
+                        $and: [{ participant_id: participantId }, timeFilter],
+                    };
+                    if (school?.aiNumberAssignedAt) {
+                        const since = new Date(school.aiNumberAssignedAt);
+                        voiceAiQuery = {
+                            $and: [
+                                { participant_id: participantId },
+                                timeFilter,
+                                {
+                                    $or: [
+                                        { created_at: { $gte: since } },
+                                        { timestamp: { $gte: since } },
+                                    ],
+                                },
+                            ],
+                        };
+                    }
+                    const rawLogs = await collection.find(voiceAiQuery).sort({ created_at: -1 }).toArray();
+                    return rawLogs.map((log) => ({
+                        id: log._id.toString(),
+                        callerPhone: log.participant_id ? log.participant_id.replace('sip_', '') : 'Unknown',
+                        callerName: 'Parent',
+                        duration: log.duration_seconds || 0,
+                        timestamp: log.created_at || log.timestamp || new Date(),
+                        recordingUrl: log.recording_url || null,
+                        callType: 'inquiry',
+                        summary: '',
+                        tourBookingDetected: false,
+                        tourBookingDate: null,
+                        aiProcessed: false,
+                        conversationId: null,
+                    }));
+                } catch (err) {
+                    console.error('[RecentCalls] VoiceAI fetch error:', err);
+                    return [];
+                }
+            })(),
+            LeadInsight.find({
+                schoolId: schoolObjectId,
+                callTimestamp: { $gte: periodStart, $lte: periodEnd },
+            })
+                .select('webhookId conversationId parentSegment tags summary isHotLead callerName callerPhone durationSeconds tourBooked callTimestamp')
+                .lean(),
+            LeadInsight.find({ schoolId: schoolObjectId })
+                .select('callerPhone callTimestamp webhookId conversationId callerName')
+                .lean(),
+            ElevenLabsWebhook.find({
+                type: 'post_call_transcription',
+                schoolId: schoolObjectId,
+            })
+                .select('_id conversation_id received_at metadata.phone_call metadata.start_time_unix_secs user_id tour_booking_extracted comprehensive_result.parent_name')
+                .lean(),
+        ]);
+
+        const callsByPhone = new Map();
+        const pushHistory = (phone, ts, webhookId, conversationId) => {
+            const key = phoneKey(phone);
+            if (!key || !ts) return;
+            if (!callsByPhone.has(key)) callsByPhone.set(key, []);
+            callsByPhone.get(key).push({
+                ts,
+                webhookId: webhookId ? String(webhookId) : '',
+                conversationId: conversationId ? String(conversationId) : '',
+            });
+        };
+        for (const row of phoneHistoryRows) {
+            pushHistory(
+                row.callerPhone,
+                row.callTimestamp ? new Date(row.callTimestamp).getTime() : 0,
+                row.webhookId,
+                row.conversationId
+            );
+        }
+        for (const wh of allWebhookMeta) {
+            const ts = wh.metadata?.start_time_unix_secs
+                ? wh.metadata.start_time_unix_secs * 1000
+                : (wh.received_at ? new Date(wh.received_at).getTime() : 0);
+            pushHistory(getCallerPhoneFromWebhook(wh, ''), ts, wh._id, wh.conversation_id);
+        }
+        for (const [key, list] of callsByPhone.entries()) {
+            const seen = new Set();
+            const deduped = [];
+            list.sort((a, b) => a.ts - b.ts || String(a.webhookId).localeCompare(String(b.webhookId)));
+            for (const row of list) {
+                const id = row.webhookId || `${row.conversationId}:${row.ts}`;
+                if (seen.has(id)) continue;
+                seen.add(id);
+                deduped.push(row);
+            }
+            callsByPhone.set(key, deduped);
+        }
+
+        const resolveCallFrequency = (call) => {
+            const key = phoneKey(call.callerPhone);
+            if (!key) {
+                return { callOrdinal: 1, callCountTotal: 1, callOrdinalLabel: '1st call' };
+            }
+            const history = callsByPhone.get(key) || [];
+            const total = history.length || 1;
+            const sessionTs = new Date(call.timestamp).getTime();
+            let ordinal = 0;
+            for (let i = 0; i < history.length; i++) {
+                const row = history[i];
+                if (
+                    (call.id && row.webhookId === String(call.id))
+                    || (call.conversationId && row.conversationId && row.conversationId === String(call.conversationId))
+                ) {
+                    ordinal = i + 1;
+                    break;
+                }
+            }
+            if (!ordinal) {
+                ordinal = history.filter((row) => row.ts <= sessionTs).length || 1;
+            }
+            return {
+                callOrdinal: ordinal,
+                callCountTotal: total,
+                callOrdinalLabel: total > 1
+                    ? `${toOrdinal(ordinal)} of ${total} calls`
+                    : `${toOrdinal(ordinal)} call`,
+            };
+        };
+
+        const hasConnectedCalendar = connectedCalendarCount > 0;
+        const insightByWebhookId = new Map(
+            cachedInsights
+                .filter((row) => row.webhookId)
+                .map((row) => [String(row.webhookId), row])
+        );
+        const insightByConversationId = new Map(
+            cachedInsights
+                .filter((row) => row.conversationId)
+                .map((row) => [String(row.conversationId), row])
+        );
+
+        const nameHistoryIndex = buildCallerNameHistoryIndex([
+            ...phoneHistoryRows.map((row) => ({
+                phone: row.callerPhone,
+                name: row.callerName,
+                timestamp: row.callTimestamp,
+                webhookId: row.webhookId,
+            })),
+            ...allWebhookMeta.map((wh) => ({
+                phone: getCallerPhoneFromWebhook(wh, ''),
+                name: getCallerNameFromWebhook(wh, null),
+                timestamp: wh.metadata?.start_time_unix_secs
+                    ? wh.metadata.start_time_unix_secs * 1000
+                    : wh.received_at,
+                webhookId: wh._id,
+            })),
+            ...callLogEntries.map((cl) => ({
+                phone: cl.from_phone_number,
+                name: cl.callerName,
+                timestamp: cl.createdAt,
+                webhookId: cl._id,
+            })),
+        ]);
+
+        const resolveName = (phone, specificName = null, callTimestamp = null, webhookId = null) =>
+            resolveCallerNameWithPastFallback(nameHistoryIndex, {
+                callerName: specificName,
+                callerPhone: phone,
+                callTimestamp,
+                webhookId,
+            });
+
+        const buildWebhookLookup = (webhooks) => {
+            const byConversationId = new Map();
+            const byPhone = new Map();
+            for (const wh of webhooks) {
+                if (wh.conversation_id) byConversationId.set(wh.conversation_id, wh);
+                const rawPhone = getCallerPhoneFromWebhook(wh, '');
+                if (!isRealPhoneForLookup(rawPhone)) continue;
+                const phone = normalizePhone(rawPhone);
+                if (!phone) continue;
+                if (!byPhone.has(phone)) byPhone.set(phone, []);
+                byPhone.get(phone).push(wh);
+            }
+            return { byConversationId, byPhone };
+        };
+
+        const findWebhookForCall = (call, lookup) => {
+            if (call.conversationId && lookup.byConversationId.has(call.conversationId)) {
+                return lookup.byConversationId.get(call.conversationId);
+            }
+            if (isWidgetCallerId(call.callerPhone)) return null;
+            const phone = normalizePhone(call.callerPhone);
+            const candidates = lookup.byPhone.get(phone) || [];
+            if (!candidates.length) return null;
+            const callTime = new Date(call.timestamp).getTime();
+            let best = null;
+            let bestDelta = Infinity;
+            for (const wh of candidates) {
+                const t = wh.metadata?.start_time_unix_secs
+                    ? wh.metadata.start_time_unix_secs * 1000
+                    : new Date(wh.received_at).getTime();
+                const delta = Math.abs(t - callTime);
+                if (delta < bestDelta && delta <= 180000) {
+                    bestDelta = delta;
+                    best = wh;
+                }
+            }
+            return best;
+        };
+
+        const webhookCalls = schoolWebhooks.map((wh) => {
+            const callTimestamp = wh.metadata?.start_time_unix_secs
+                ? new Date(wh.metadata.start_time_unix_secs * 1000)
+                : wh.received_at;
+            const bookingConfirmed = hasConnectedCalendar && Boolean(wh.tour_booking_detected);
+            const identity = resolveName(
+                getCallerPhoneFromWebhook(wh, ''),
+                getCallerNameFromWebhook(wh, null),
+                callTimestamp,
+                wh._id
+            );
+            return {
+                id: wh._id.toString(),
+                conversationId: wh.conversation_id,
+                callerPhone: getCallerPhoneFromWebhook(wh, 'Web Widget'),
+                callerName: identity.callerName,
+                usedPastCallName: identity.usedPastCallName,
+                duration: getCallDurationSeconds(wh),
+                timestamp: callTimestamp,
+                recordingUrl: wh.conversation_id
+                    ? `${backendUrl}/api/school/calls/${wh.conversation_id}/audio?token=${userToken}`
+                    : null,
+                callType: 'inquiry',
+                summary: resolveWebhookSummary(wh),
+                tourBookingDetected: bookingConfirmed,
+                tourBookingDate: bookingConfirmed ? (wh.tour_booking_date || null) : null,
+                aiProcessed: wh.ai_processed || false,
+            };
+        });
+
+        const callLogCalls = callLogEntries.map((cl) => {
+            const identity = resolveName(cl.from_phone_number || '', cl.callerName, cl.createdAt, cl._id);
+            return {
+            id: cl._id.toString(),
+            conversationId: cl.conversation_id,
+            callerPhone: cl.from_phone_number || 'Unknown',
+            callerName: identity.callerName,
+            usedPastCallName: identity.usedPastCallName,
+            duration: cl.duration || 0,
+            timestamp: cl.createdAt,
+            recordingUrl: cl.conversation_id
+                ? `${backendUrl}/api/school/calls/${cl.conversation_id}/audio?token=${userToken}`
+                : null,
+            callType: cl.callType || 'inquiry',
+            summary: cl.summary || '',
+            tourBookingDetected: false,
+            tourBookingDate: null,
+            aiProcessed: true,
+        };
+        });
+
+        const allCallsMap = new Map();
+        voiceAiCalls.forEach((c) => {
+            const key = `${normalizePhone(c.callerPhone)}_${new Date(c.timestamp).getTime()}`;
+            allCallsMap.set(key, c);
+        });
+        callLogCalls.forEach((clc) => {
+            const key = clc.conversationId || `${normalizePhone(clc.callerPhone)}_${new Date(clc.timestamp).getTime()}`;
+            allCallsMap.set(key, clc);
+        });
+        webhookCalls.forEach((whc) => {
+            const convKey = whc.conversationId || `${normalizePhone(whc.callerPhone)}_${new Date(whc.timestamp).getTime()}`;
+            if (allCallsMap.has(convKey)) {
+                const existing = allCallsMap.get(convKey);
+                allCallsMap.set(convKey, { ...existing, ...whc, id: existing.id });
+                return;
+            }
+            const whPhone = normalizePhone(whc.callerPhone);
+            const whTime = new Date(whc.timestamp).getTime();
+            let voiceKey = null;
+            for (const [key, existing] of allCallsMap.entries()) {
+                if (existing.conversationId) continue;
+                const phone = normalizePhone(existing.callerPhone);
+                const callTime = new Date(existing.timestamp).getTime();
+                if (phone && phone === whPhone && Math.abs(callTime - whTime) <= 5 * 60 * 1000) {
+                    voiceKey = key;
+                    break;
+                }
+            }
+            if (voiceKey) {
+                const existing = allCallsMap.get(voiceKey);
+                allCallsMap.set(voiceKey, { ...existing, ...whc, id: existing.id });
+            } else {
+                allCallsMap.set(convKey, whc);
+            }
+        });
+
+        const calls = Array.from(allCallsMap.values())
+            .map((c) => {
+                const identity = resolveName(c.callerPhone, c.callerName, c.timestamp, c.id);
+                return {
+                    ...c,
+                    callerName: identity.callerName,
+                    usedPastCallName: Boolean(c.usedPastCallName || identity.usedPastCallName),
+                };
+            })
+            .filter((c) => isWithinPeriod(c.timestamp, periodStart, periodEnd))
+            .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+
+        const webhookLookup = buildWebhookLookup(schoolWebhooks);
+
+        const resolveCallWebhook = (call) => {
+            if (call.conversationId) {
+                return schoolWebhooks.find((w) => w.conversation_id === call.conversationId) || null;
+            }
+            return findWebhookForCall(call, webhookLookup);
+        };
+
+        const resolveInsightFromWebhook = (wh) => {
+            if (!wh) return null;
+            if (wh.comprehensive_result) {
+                return mapComprehensiveResult(wh.comprehensive_result, wh);
+            }
+            return mapSummaryFallback(wh);
+        };
+
+        const resolveCachedInsight = (call, wh) => {
+            if (wh?._id && insightByWebhookId.has(String(wh._id))) {
+                return insightByWebhookId.get(String(wh._id));
+            }
+            if (call.conversationId && insightByConversationId.has(String(call.conversationId))) {
+                return insightByConversationId.get(String(call.conversationId));
+            }
+            return null;
+        };
+
+        const resolveCallParentSegment = (call, wh) => {
+            const cached = resolveCachedInsight(call, wh);
+            if (cached?.parentSegment) return cached.parentSegment;
+            if (wh) {
+                return resolveInsightFromWebhook(wh)?.parentSegment || 'unknown';
+            }
+            if (!call.summary && !call.aiProcessed) return 'unknown';
+            return 'new_parent';
+        };
+
+        const resolveCallTags = (call, wh) => {
+            const cached = resolveCachedInsight(call, wh);
+            if (cached?.tags?.length) {
+                return ensureTourBookedEmailMissingTag(cached.tags, {
+                    tourBooked: wh ? isTourBooked(wh) : Boolean(cached.tourBooked),
+                    parentEmail: wh ? resolveParentEmail(wh, wh.comprehensive_result) : '',
+                    emailMissing: wh ? isTourBookedEmailMissing(wh) : false,
+                });
+            }
+            if (!wh) return [];
+            const fresh = resolveInsightFromWebhook(wh);
+            const baseTags = fresh?.tags || [];
+            return ensureTourBookedEmailMissingTag(baseTags, {
+                tourBooked: isTourBooked(wh),
+                parentEmail: resolveParentEmail(wh, wh.comprehensive_result),
+                emailMissing: isTourBookedEmailMissing(wh),
+            });
+        };
+
+        const resolveCallTourEmailMissing = (call, wh, tags = []) => {
+            if (tags.some((tag) => String(tag).toLowerCase().includes('email missing'))) {
+                return true;
+            }
+            if (!call.tourBookingDetected) return false;
+            let resolvedWh = wh;
+            if (!resolvedWh && call.callerPhone) {
+                const phone = normalizePhone(call.callerPhone);
+                resolvedWh = schoolWebhooks.find((w) => {
+                    if (!w.tour_booking_detected) return false;
+                    return normalizePhone(getCallerPhoneFromWebhook(w, '')) === phone;
+                }) || null;
+            }
+            if (!resolvedWh) return false;
+            return isTourBookedEmailMissing(resolvedWh);
+        };
+
+        const resolveCallSummary = (call, wh) => {
+            const cached = resolveCachedInsight(call, wh);
+            if (wh) return resolveWebhookSummary(wh);
+            if (cached?.summary) return cached.summary;
+            return call.summary || '';
+        };
+
+        // No top-N limit — return every call in the selected window with segment tags
+        const recentCalls = calls.map((c) => {
+            const wh = resolveCallWebhook(c);
+            let tags = resolveCallTags(c, wh);
+            if (c.usedPastCallName) tags = withPastCallNameTag(tags);
+            const frequency = resolveCallFrequency(c);
+            return {
+                id: c.id,
+                conversationId: c.conversationId || null,
+                callerName: c.callerName,
+                callerPhone: c.callerPhone,
+                callType: c.callType,
+                duration: Math.round(Number(c.duration) || 0),
+                timestamp: c.timestamp,
+                recordingUrl: c.recordingUrl,
+                summary: resolveCallSummary(c, wh),
+                tourBookingDetected: c.tourBookingDetected || false,
+                tourBookingDate: c.tourBookingDate || null,
+                tourEmailMissing: resolveCallTourEmailMissing(c, wh, tags),
+                tags,
+                aiProcessed: c.aiProcessed || false,
+                parentSegment: resolveCallParentSegment(c, wh),
+                callOrdinal: frequency.callOrdinal,
+                callCountTotal: frequency.callCountTotal,
+                callOrdinalLabel: frequency.callOrdinalLabel,
+            };
+        });
+
+        res.json({
+            recentCalls,
+            period,
+            periodStart,
+            periodEnd,
+            total: recentCalls.length,
+        });
+    } catch (err) {
+        console.error('School recent-calls error:', err);
         res.status(500).json({ error: 'Internal server error' });
     }
 });
@@ -1235,198 +1811,364 @@ router.post('/wordcloud/generate', async (req, res) => {
 router.get('/call-logs', async (req, res) => {
     try {
         const schoolId = req.user.schoolId;
-        const school = await School.findById(schoolId).select('aiNumber aiNumberAssignedAt elevenlabsAgentId').lean();
+        const school = await School.findById(schoolId).select('aiNumber aiNumberAssignedAt elevenlabsAgentId createdAt').lean();
 
         if (!school) {
             return res.status(404).json({ error: 'School not found' });
         }
 
+        const { resolveDashboardPeriod, isWithinPeriod } = require('../utils/dashboardPeriod');
+        // Default to all-time so schools see every call, not a truncated window.
+        const periodQuery = { ...req.query, period: req.query.period || 'all' };
+        if (periodQuery.period === 'all' && !periodQuery.startDate && school.aiNumberAssignedAt) {
+            periodQuery.startDate = new Date(school.aiNumberAssignedAt).toISOString().slice(0, 10);
+        } else if (periodQuery.period === 'all' && !periodQuery.startDate && school.createdAt) {
+            periodQuery.startDate = new Date(school.createdAt).toISOString().slice(0, 10);
+        }
+        const periodWindow = resolveDashboardPeriod(periodQuery);
+        if (periodWindow.error) {
+            return res.status(400).json({ error: periodWindow.error });
+        }
+        const { period, periodStart, periodEnd } = periodWindow;
+        const startUnix = Math.floor(periodStart.getTime() / 1000);
+        const endUnix = Math.floor(periodEnd.getTime() / 1000);
+
         const userToken = req.headers.authorization?.split(' ')[1] || '';
         const backendUrl = process.env.BACKEND_URL || `${req.protocol}://${req.get('host')}`;
 
-        // Helper to normalize phones
         const normalizePhone = (phone) => {
             if (!phone) return '';
             return phone.replace(/\D/g, '');
         };
 
-        const buildWebhookLookup = (webhooks) => {
-            const byConversationId = new Map();
-            const byPhone = new Map();
-            for (const wh of webhooks) {
-                if (wh.conversation_id) byConversationId.set(wh.conversation_id, wh);
-                const rawPhone = getCallerPhoneFromWebhook(wh, '');
-                if (!isRealPhoneForLookup(rawPhone)) continue;
-                const phone = normalizePhone(rawPhone);
-                if (!phone) continue;
-                if (!byPhone.has(phone)) byPhone.set(phone, []);
-                byPhone.get(phone).push(wh);
-            }
-            return { byConversationId, byPhone };
+        const schoolAiNumber = normalizePhone(school.aiNumber || '');
+        const schoolObjectId = new mongoose.Types.ObjectId(schoolId);
+
+        const phoneKey = (phone) => {
+            const digits = normalizePhone(phone);
+            if (digits.length >= 10) return digits.slice(-10);
+            return digits.length >= 7 ? digits : '';
         };
 
-        const findWebhookForCall = (call, lookup) => {
-            if (call.conversationId && lookup.byConversationId.has(call.conversationId)) {
-                return lookup.byConversationId.get(call.conversationId);
+        const toOrdinal = (n) => {
+            const num = Number(n) || 0;
+            const mod100 = num % 100;
+            if (mod100 >= 11 && mod100 <= 13) return `${num}th`;
+            switch (num % 10) {
+                case 1: return `${num}st`;
+                case 2: return `${num}nd`;
+                case 3: return `${num}rd`;
+                default: return `${num}th`;
             }
-            if (isWidgetCallerId(call.callerPhone)) return null;
-            const phone = normalizePhone(call.callerPhone);
-            const candidates = lookup.byPhone.get(phone) || [];
-            if (!candidates.length) return null;
-            const callTime = new Date(call.timestamp).getTime();
-            let best = null;
-            let bestDelta = Infinity;
-            for (const wh of candidates) {
-                const t = wh.metadata?.start_time_unix_secs
+        };
+
+        // Webhooks + LeadInsight are the source of truth for caller identity and tags.
+        // phoneHistory is all-time so "3rd call" is correct even inside a filtered window.
+        const [webhooks, cachedInsights, phoneHistoryRows, allWebhookMeta] = await Promise.all([
+            ElevenLabsWebhook.find({
+                type: 'post_call_transcription',
+                schoolId: schoolObjectId,
+                $or: [
+                    { received_at: { $gte: periodStart, $lte: periodEnd } },
+                    {
+                        'metadata.start_time_unix_secs': {
+                            $gte: startUnix,
+                            $lte: endUnix,
+                        },
+                    },
+                ],
+            })
+                .select('-raw_payload -audio_base64')
+                .sort({ received_at: -1 })
+                .lean(),
+            LeadInsight.find({
+                schoolId: schoolObjectId,
+                $or: [
+                    { callTimestamp: { $gte: periodStart, $lte: periodEnd } },
+                    { callTimestamp: null, createdAt: { $gte: periodStart, $lte: periodEnd } },
+                ],
+            })
+                .select('webhookId conversationId parentSegment tags summary callerName callerPhone callTimestamp')
+                .lean(),
+            LeadInsight.find({ schoolId: schoolObjectId })
+                .select('callerPhone callTimestamp webhookId conversationId callerName')
+                .lean(),
+            ElevenLabsWebhook.find({
+                type: 'post_call_transcription',
+                schoolId: schoolObjectId,
+            })
+                .select('_id conversation_id received_at metadata.phone_call metadata.start_time_unix_secs user_id tour_booking_extracted comprehensive_result.parent_name')
+                .lean(),
+        ]);
+
+        const nameHistoryIndex = buildCallerNameHistoryIndex([
+            ...phoneHistoryRows.map((row) => ({
+                phone: row.callerPhone,
+                name: row.callerName,
+                timestamp: row.callTimestamp,
+                webhookId: row.webhookId,
+            })),
+            ...allWebhookMeta.map((wh) => ({
+                phone: getCallerPhoneFromWebhook(wh, ''),
+                name: getCallerNameFromWebhook(wh, null),
+                timestamp: wh.metadata?.start_time_unix_secs
                     ? wh.metadata.start_time_unix_secs * 1000
-                    : new Date(wh.received_at).getTime();
-                const delta = Math.abs(t - callTime);
-                if (delta < bestDelta && delta <= 180000) {
-                    bestDelta = delta;
-                    best = wh;
+                    : wh.received_at,
+                webhookId: wh._id,
+            })),
+        ]);
+
+        const callsByPhone = new Map();
+        const pushHistory = (phone, ts, webhookId, conversationId) => {
+            const key = phoneKey(phone);
+            if (!key || !ts) return;
+            if (!callsByPhone.has(key)) callsByPhone.set(key, []);
+            callsByPhone.get(key).push({
+                ts,
+                webhookId: webhookId ? String(webhookId) : '',
+                conversationId: conversationId ? String(conversationId) : '',
+            });
+        };
+
+        for (const row of phoneHistoryRows) {
+            pushHistory(
+                row.callerPhone,
+                row.callTimestamp ? new Date(row.callTimestamp).getTime() : 0,
+                row.webhookId,
+                row.conversationId
+            );
+        }
+        for (const wh of allWebhookMeta) {
+            const ts = wh.metadata?.start_time_unix_secs
+                ? wh.metadata.start_time_unix_secs * 1000
+                : (wh.received_at ? new Date(wh.received_at).getTime() : 0);
+            pushHistory(getCallerPhoneFromWebhook(wh, ''), ts, wh._id, wh.conversation_id);
+        }
+        // Dedupe identical webhook entries, keep chronological order
+        for (const [key, list] of callsByPhone.entries()) {
+            const seen = new Set();
+            const deduped = [];
+            list.sort((a, b) => a.ts - b.ts || String(a.webhookId).localeCompare(String(b.webhookId)));
+            for (const row of list) {
+                const id = row.webhookId || `${row.conversationId}:${row.ts}`;
+                if (seen.has(id)) continue;
+                seen.add(id);
+                deduped.push(row);
+            }
+            callsByPhone.set(key, deduped);
+        }
+
+        const resolveCallFrequency = (session) => {
+            const key = phoneKey(session.participantId);
+            if (!key) {
+                return { callOrdinal: 1, callCountTotal: 1, callOrdinalLabel: '1st call' };
+            }
+            const history = callsByPhone.get(key) || [];
+            const total = history.length || 1;
+            const sessionTs = new Date(session.createdAt).getTime();
+            let ordinal = 0;
+            for (let i = 0; i < history.length; i++) {
+                const row = history[i];
+                if (
+                    (session.id && row.webhookId === String(session.id))
+                    || (session.sessionId && row.conversationId && row.conversationId === String(session.sessionId))
+                ) {
+                    ordinal = i + 1;
+                    break;
                 }
             }
-            return best;
+            if (!ordinal) {
+                // Fallback: count how many prior/equal timestamp calls from this number
+                ordinal = history.filter((row) => row.ts <= sessionTs).length || 1;
+            }
+            return {
+                callOrdinal: ordinal,
+                callCountTotal: total,
+                callOrdinalLabel: total > 1
+                    ? `${toOrdinal(ordinal)} of ${total} calls`
+                    : `${toOrdinal(ordinal)} call`,
+            };
         };
 
-        const resolveDashboardCallSummary = (call, lookup) => {
-            const wh = findWebhookForCall(call, lookup);
-            if (wh) return resolveWebhookSummary(wh);
-            return call.summary || '';
-        };
-        const schoolAiNumber = normalizePhone(school.aiNumber || '');
+        const insightByWebhookId = new Map(
+            cachedInsights.filter((row) => row.webhookId).map((row) => [String(row.webhookId), row])
+        );
+        const insightByConversationId = new Map(
+            cachedInsights.filter((row) => row.conversationId).map((row) => [String(row.conversationId), row])
+        );
 
-        // ── 1. Fetch SIP Logs (VoiceAI) ──
-        let voiceAiSessions = [];
+        const resolveInsightForWebhook = (wh) => {
+            if (wh?._id && insightByWebhookId.has(String(wh._id))) {
+                return insightByWebhookId.get(String(wh._id));
+            }
+            if (wh?.conversation_id && insightByConversationId.has(String(wh.conversation_id))) {
+                return insightByConversationId.get(String(wh.conversation_id));
+            }
+            return null;
+        };
+
+        const resolveFreshInsight = (wh) => {
+            if (!wh) return null;
+            if (wh.comprehensive_result) {
+                return mapComprehensiveResult(wh.comprehensive_result, wh);
+            }
+            return mapSummaryFallback(wh);
+        };
+
+        // Optional VoiceAI recordings keyed by time (SIP participant is the school number, not caller).
+        const voiceRecordingByTime = [];
         if (schoolAiNumber) {
             try {
-                const digits = schoolAiNumber;
-                const normalizedNumber = `+${digits}`;
-                const participantId = `sip_${normalizedNumber}`;
-
+                const participantId = `sip_+${schoolAiNumber}`;
                 const bennyDb = mongoose.connection.useDb('benny');
                 const collection = bennyDb.collection('voiceAI');
-
-                let voiceSessionQuery = { participant_id: participantId };
-                if (school.aiNumberAssignedAt) {
-                    const since = new Date(school.aiNumberAssignedAt);
-                    voiceSessionQuery = {
-                        $and: [
-                            { participant_id: participantId },
-                            {
-                                $or: [
-                                    { created_at: { $gte: since } },
-                                    { timestamp: { $gte: since } },
-                                ],
-                            },
-                        ],
-                    };
-                }
-
-                const schoolLogs = await collection.find(voiceSessionQuery).project({ session_id: 1 }).toArray();
-                const sessionIds = [...new Set(schoolLogs.map(l => l.session_id))];
-
-                if (sessionIds.length > 0) {
-                    let allLogs = await collection.find({ session_id: { $in: sessionIds } }).sort({ created_at: -1 }).toArray();
-                    if (school.aiNumberAssignedAt) {
-                        const sinceMs = new Date(school.aiNumberAssignedAt).getTime();
-                        allLogs = allLogs.filter((log) => {
-                            const t = log.created_at || log.timestamp;
-                            return t && new Date(t).getTime() >= sinceMs;
-                        });
-                    }
-                    const sessionsMap = {};
-                    allLogs.forEach(log => {
-                        const sid = log.session_id;
-                        if (!sessionsMap[sid]) {
-                            sessionsMap[sid] = {
-                                id: log._id.toString(),
-                                sessionId: sid,
-                                participantId: log.participant_id?.replace('sip_', '') || 'Unknown',
-                                transcript: [],
-                                summary: log.transcript_summary || '',
-                                recordingUrl: log.recording_url,
-                                duration: log.duration_seconds || 0,
-                                createdAt: log.created_at || log.timestamp
-                            };
-                        }
-                        if (Array.isArray(log.transcript)) {
-                            log.transcript.forEach(t => {
-                                sessionsMap[sid].transcript.push({
-                                    role: t.role || 'unknown',
-                                    text: t.content || t.text || t.message || (typeof t === 'string' ? t : ''),
-                                    timestamp: t.timestamp || log.created_at
-                                });
-                            });
-                        }
-                        if (log.recording_url && !sessionsMap[sid].recordingUrl) sessionsMap[sid].recordingUrl = log.recording_url;
+                const timeFilter = {
+                    $or: [
+                        { created_at: { $gte: periodStart, $lte: periodEnd } },
+                        { timestamp: { $gte: periodStart, $lte: periodEnd } },
+                    ],
+                };
+                const rawLogs = await collection.find({
+                    $and: [{ participant_id: participantId }, timeFilter],
+                }).project({
+                    recording_url: 1,
+                    duration_seconds: 1,
+                    created_at: 1,
+                    timestamp: 1,
+                    transcript_summary: 1,
+                }).toArray();
+                for (const log of rawLogs) {
+                    const t = log.created_at || log.timestamp;
+                    if (!t || !isWithinPeriod(t, periodStart, periodEnd)) continue;
+                    if (!log.recording_url) continue;
+                    voiceRecordingByTime.push({
+                        at: new Date(t).getTime(),
+                        recordingUrl: log.recording_url,
+                        duration: log.duration_seconds || 0,
+                        summary: log.transcript_summary || '',
                     });
-                    voiceAiSessions = Object.values(sessionsMap);
                 }
             } catch (err) {
                 console.error('[CallLogs] VoiceAI error:', err);
             }
         }
 
-        const schoolObjectId = new mongoose.Types.ObjectId(schoolId);
-        // ── 2. Fetch AI Logs (ElevenLabs Webhooks) ──
-        const webhooks = await ElevenLabsWebhook.find({
-            type: 'post_call_transcription',
-            ai_processed: true,
-            schoolId: schoolObjectId
-        }).sort({ received_at: -1 }).limit(50).lean();
+        const findNearbyVoiceRecording = (callMs) => {
+            let best = null;
+            let bestDelta = Infinity;
+            for (const row of voiceRecordingByTime) {
+                const delta = Math.abs(row.at - callMs);
+                if (delta < bestDelta && delta <= 5 * 60 * 1000) {
+                    bestDelta = delta;
+                    best = row;
+                }
+            }
+            return best;
+        };
 
-        const webhookSessions = webhooks.map(wh => {
-            const transcript = Array.isArray(wh.transcript) ? wh.transcript.map(t => ({
-                role: t.role === 'agent' ? 'Assistant' : 'Parent',
-                text: t.message || t.text || '',
-                timestamp: t.time_in_call_secs ? new Date(wh.received_at.getTime() + t.time_in_call_secs * 1000) : wh.received_at
-            })) : [];
+        const finalSessionsMap = new Map();
 
-            return {
+        for (const wh of webhooks) {
+            const callTimestamp = wh.metadata?.start_time_unix_secs
+                ? new Date(wh.metadata.start_time_unix_secs * 1000)
+                : wh.received_at;
+            if (!isWithinPeriod(callTimestamp, periodStart, periodEnd)) continue;
+
+            const cached = resolveInsightForWebhook(wh);
+            const fresh = resolveFreshInsight(wh);
+            const parentSegment = cached?.parentSegment || fresh?.parentSegment || 'unknown';
+            const baseTags = (cached?.tags?.length ? cached.tags : (fresh?.tags || []));
+            const callerNameFromWebhook = getCallerNameFromWebhook(wh, null);
+            const cachedOrWebhookName = isUsableCallerName(cached?.callerName)
+                ? String(cached.callerName).trim()
+                : (isUsableCallerName(callerNameFromWebhook) ? String(callerNameFromWebhook).trim() : null);
+            const identity = resolveCallerNameWithPastFallback(nameHistoryIndex, {
+                callerName: cachedOrWebhookName,
+                callerPhone: getCallerPhoneFromWebhook(wh, ''),
+                callTimestamp,
+                webhookId: wh._id,
+            });
+            let tags = ensureTourBookedEmailMissingTag(baseTags, {
+                tourBooked: isTourBooked(wh),
+                parentEmail: resolveParentEmail(wh, wh.comprehensive_result),
+                emailMissing: isTourBookedEmailMissing(wh),
+            });
+            if (identity.usedPastCallName) {
+                tags = withPastCallNameTag(tags);
+            }
+            const callerName = identity.usedPastCallName || isUsableCallerName(identity.callerName)
+                ? identity.callerName
+                : null;
+
+            const transcript = Array.isArray(wh.transcript)
+                ? wh.transcript.map((t) => ({
+                    role: t.role === 'agent' ? 'Assistant' : 'Parent',
+                    text: t.message || t.text || '',
+                    timestamp: t.time_in_call_secs
+                        ? new Date(new Date(wh.received_at).getTime() + t.time_in_call_secs * 1000)
+                        : wh.received_at,
+                })).filter((t) => t.text)
+                : [];
+
+            const callMs = new Date(callTimestamp).getTime();
+            const nearbyVoice = findNearbyVoiceRecording(callMs);
+            const recordingUrl = wh.conversation_id
+                ? `${backendUrl}/api/school/calls/${wh.conversation_id}/audio?token=${userToken}`
+                : (nearbyVoice?.recordingUrl || null);
+
+            const key = wh.conversation_id || `${normalizePhone(getCallerPhoneFromWebhook(wh, ''))}_${callMs}`;
+            finalSessionsMap.set(key, {
                 id: wh._id.toString(),
                 sessionId: wh.conversation_id,
                 participantId: getCallerPhoneFromWebhook(wh, 'Unknown'),
+                callerName,
                 transcript,
-                summary: resolveWebhookSummary(wh),
-                recordingUrl: `${backendUrl}/api/school/calls/${wh.conversation_id}/audio?token=${userToken}`,
-                duration: getCallDurationSeconds(wh),
-                createdAt: wh.received_at
-            };
-        });
-
-        // ── 3. Merge and Deduplicate ──
-        const finalSessionsMap = new Map();
-        voiceAiSessions.forEach(s => {
-            const key = `${normalizePhone(s.participantId)}_${new Date(s.createdAt).getTime()}`;
-            finalSessionsMap.set(key, s);
-        });
-
-        webhookSessions.forEach(ws => {
-            const key = ws.sessionId || `${normalizePhone(ws.participantId)}_${new Date(ws.createdAt).getTime()}`;
-            if (finalSessionsMap.has(key)) {
-                const existing = finalSessionsMap.get(key);
-                // Merge transcript and recording if webhook has better data
-                finalSessionsMap.set(key, {
-                    ...existing,
-                    ...ws,
-                    transcript: ws.transcript.length > existing.transcript.length ? ws.transcript : existing.transcript,
-                    id: existing.id // Keep original ID for stability
-                });
-            } else {
-                finalSessionsMap.set(key, ws);
-            }
-        });
+                summary: resolveWebhookSummary(wh) || cached?.summary || nearbyVoice?.summary || '',
+                recordingUrl,
+                duration: getCallDurationSeconds(wh) || nearbyVoice?.duration || 0,
+                createdAt: callTimestamp,
+                parentSegment,
+                tags,
+            });
+        }
 
         const sortedLogs = Array.from(finalSessionsMap.values())
-            .map(session => {
-                session.transcript.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
-                session.transcript = session.transcript.filter(t => t.text);
+            .map((session) => {
+                if (Array.isArray(session.transcript)) {
+                    session.transcript.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+                } else {
+                    session.transcript = [];
+                }
+                session.parentSegment = session.parentSegment || 'unknown';
+                session.tags = Array.isArray(session.tags) ? session.tags : [];
+                // Keep segment label in tags for UI consistency
+                const segmentLabel =
+                    session.parentSegment === 'current_family' ? 'Current Family'
+                        : session.parentSegment === 'unknown' ? 'Unknown'
+                            : 'New Parent';
+                if (!session.tags.some((t) => String(t).toLowerCase() === segmentLabel.toLowerCase())) {
+                    session.tags = [segmentLabel, ...session.tags];
+                }
+                session.callerName = isUsableCallerName(session.callerName)
+                    ? String(session.callerName).trim()
+                    : null;
+                const frequency = resolveCallFrequency(session);
+                session.callOrdinal = frequency.callOrdinal;
+                session.callCountTotal = frequency.callCountTotal;
+                session.callOrdinalLabel = frequency.callOrdinalLabel;
                 return session;
             })
-            .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+            .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
 
-        res.json(sortedLogs);
+        console.log(`[CallLogs] school=${schoolId} period=${period} total=${sortedLogs.length} webhooks=${webhooks.length}`);
+
+        res.json({
+            logs: sortedLogs,
+            period,
+            periodStart,
+            periodEnd,
+            total: sortedLogs.length,
+        });
     } catch (err) {
         console.error('Call logs error:', err);
         res.status(500).json({ error: 'Internal server error' });

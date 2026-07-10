@@ -1,9 +1,177 @@
 const crypto = require('crypto');
 const LeadInsight = require('../models/LeadInsight');
 const { extractTourDetails, mergeParentQuestionsFromExtraction, filterSchoolQuestions } = require('../utils/openai');
-const { getCallerPhoneFromWebhook, getCallDurationSeconds, getCallerNameFromWebhook } = require('../utils/webhookHelpers');
+const { getCallerPhoneFromWebhook, getCallDurationSeconds, getCallerNameFromWebhook, isUsableCallerName, isRealPhoneForLookup, isWidgetCallerId } = require('../utils/webhookHelpers');
 const { resolveWebhookSummary, resolveCachedSummary, isNoMeaningfulInteractionSummary, isCurrentFamilyCall, callerIdentifiedAsCurrentFamily, callerIdentifiedAsNewFamily, callerWantsHumanRoutingOnly, callerIdentifiedAsNewFamilyFromTranscript, callerWantsHumanRoutingOnlyFromTranscript } = require('../utils/currentFamilyTransfer');
 
+const PAST_CALL_NAME_TAG = 'Past call name used';
+
+function phoneKeyForLookup(phone) {
+    const digits = String(phone || '').replace(/\D/g, '');
+    if (digits.length >= 10) return digits.slice(-10);
+    return digits.length >= 7 ? digits : '';
+}
+
+function hasPastCallNameTag(tags = []) {
+    return (Array.isArray(tags) ? tags : []).some(
+        (tag) => String(tag).trim().toLowerCase() === PAST_CALL_NAME_TAG.toLowerCase()
+    );
+}
+
+function withPastCallNameTag(tags = []) {
+    const next = Array.isArray(tags) ? [...tags] : [];
+    if (!hasPastCallNameTag(next)) next.push(PAST_CALL_NAME_TAG);
+    return next;
+}
+
+/**
+ * Find the most recent usable caller name for this phone from earlier school calls.
+ */
+async function findPriorUsableCallerName(schoolId, phone, { beforeDate = null, excludeWebhookId = null } = {}) {
+    const key = phoneKeyForLookup(phone);
+    if (!schoolId || !key || !isRealPhoneForLookup(phone)) return null;
+
+    const query = {
+        schoolId,
+        callerName: { $exists: true, $nin: ['', null] },
+    };
+    if (excludeWebhookId) query.webhookId = { $ne: excludeWebhookId };
+    if (beforeDate) query.callTimestamp = { $lt: new Date(beforeDate) };
+
+    const rows = await LeadInsight.find(query)
+        .select('callerName callerPhone callTimestamp webhookId')
+        .sort({ callTimestamp: -1 })
+        .limit(80)
+        .lean();
+
+    for (const row of rows) {
+        if (phoneKeyForLookup(row.callerPhone) !== key) continue;
+        if (!isUsableCallerName(row.callerName)) continue;
+        return String(row.callerName).trim();
+    }
+    return null;
+}
+
+/**
+ * If this call has no usable name, reuse the name from a prior call on the same number
+ * and mark it with the "Past call name used" tag.
+ */
+async function applyPriorCallerNameFromHistory(schoolId, {
+    callerName,
+    callerPhone,
+    tags = [],
+    callTimestamp = null,
+    webhookId = null,
+} = {}) {
+    if (isUsableCallerName(callerName)) {
+        return {
+            callerName: String(callerName).trim(),
+            tags: Array.isArray(tags) ? tags : [],
+            usedPastCallName: false,
+        };
+    }
+    if (!isRealPhoneForLookup(callerPhone)) {
+        return {
+            callerName: callerName || 'Parent',
+            tags: Array.isArray(tags) ? tags : [],
+            usedPastCallName: false,
+        };
+    }
+
+    const priorName = await findPriorUsableCallerName(schoolId, callerPhone, {
+        beforeDate: callTimestamp || null,
+        excludeWebhookId: webhookId || null,
+    });
+
+    if (!priorName) {
+        return {
+            callerName: callerName || 'Parent',
+            tags: Array.isArray(tags) ? tags : [],
+            usedPastCallName: false,
+        };
+    }
+
+    return {
+        callerName: priorName,
+        tags: withPastCallNameTag(tags),
+        usedPastCallName: true,
+    };
+}
+
+/**
+ * Build an in-memory index of usable caller names by phone for chronological lookup.
+ * entries: [{ phone, name, timestamp, webhookId? }]
+ */
+function buildCallerNameHistoryIndex(entries = []) {
+    const map = new Map();
+    for (const entry of entries) {
+        if (!isUsableCallerName(entry?.name) || !isRealPhoneForLookup(entry?.phone)) continue;
+        const key = phoneKeyForLookup(entry.phone);
+        if (!key) continue;
+        const ts = entry.timestamp ? new Date(entry.timestamp).getTime() : 0;
+        if (!Number.isFinite(ts) || ts <= 0) continue;
+        if (!map.has(key)) map.set(key, []);
+        map.get(key).push({
+            ts,
+            name: String(entry.name).trim(),
+            webhookId: entry.webhookId ? String(entry.webhookId) : '',
+        });
+    }
+    for (const [key, list] of map.entries()) {
+        list.sort((a, b) => a.ts - b.ts || String(a.webhookId).localeCompare(String(b.webhookId)));
+        map.set(key, list);
+    }
+    return map;
+}
+
+/** Latest usable name for this phone strictly before beforeTs (ms). */
+function lookupPriorCallerNameFromIndex(index, phone, beforeTs, excludeWebhookId = null) {
+    const key = phoneKeyForLookup(phone);
+    if (!key || !index) return null;
+    const list = index.get(key) || [];
+    const cutoff = Number(beforeTs) || 0;
+    let best = null;
+    for (const row of list) {
+        if (cutoff && row.ts >= cutoff) break;
+        if (excludeWebhookId && row.webhookId && row.webhookId === String(excludeWebhookId)) continue;
+        best = row.name;
+    }
+    return best;
+}
+
+/**
+ * Resolve display name: prefer this call's name; otherwise reuse an earlier call's name
+ * and mark usedPastCallName so callers can add PAST_CALL_NAME_TAG.
+ */
+function resolveCallerNameWithPastFallback(index, {
+    callerName = null,
+    callerPhone = null,
+    callTimestamp = null,
+    webhookId = null,
+} = {}) {
+    if (isUsableCallerName(callerName)) {
+        return {
+            callerName: String(callerName).trim(),
+            usedPastCallName: false,
+        };
+    }
+    if (isWidgetCallerId(callerPhone)) {
+        return { callerName: 'Unknown Caller', usedPastCallName: false };
+    }
+    if (!isRealPhoneForLookup(callerPhone)) {
+        return { callerName: callerName || 'Parent', usedPastCallName: false };
+    }
+    const prior = lookupPriorCallerNameFromIndex(
+        index,
+        callerPhone,
+        callTimestamp ? new Date(callTimestamp).getTime() : Date.now(),
+        webhookId
+    );
+    if (prior) {
+        return { callerName: prior, usedPastCallName: true };
+    }
+    return { callerName: callerName || 'Parent', usedPastCallName: false };
+}
 /** New-parent enrollment / tour intent — word boundaries so "enrolled" does not match. */
 const NEW_PARENT_INTENT_PATTERNS = [
     /\benroll(?:ment|ing)?\b/i,
@@ -901,6 +1069,15 @@ async function upsertLeadInsight({ schoolId, webhook, insightData, transcriptHas
     if (!schoolId || !webhook?._id) return null;
 
     const payload = buildLeadInsightPersistPayload(schoolId, webhook, insightData, transcriptHash);
+    const resolved = await applyPriorCallerNameFromHistory(schoolId, {
+        callerName: payload.callerName,
+        callerPhone: payload.callerPhone,
+        tags: payload.tags,
+        callTimestamp: payload.callTimestamp,
+        webhookId: webhook._id,
+    });
+    payload.callerName = resolved.callerName;
+    payload.tags = resolved.tags;
 
     return LeadInsight.findOneAndUpdate(
         { schoolId, webhookId: webhook._id },
@@ -1000,20 +1177,40 @@ async function resolveInsightsForWebhooks(webhooks, schoolId, options = {}) {
         return resolved;
     }
 
-    const bulkOps = toPersist.map(({ webhook, insightData, transcriptHash }) => ({
-        updateOne: {
-            filter: { schoolId, webhookId: webhook._id },
-            update: {
-                $set: buildLeadInsightPersistPayload(
-                    schoolId,
-                    webhook,
-                    insightData,
-                    insightData.transcriptHash || transcriptHash
-                ),
+    const bulkOps = [];
+    for (const { webhook, insightData, transcriptHash } of toPersist) {
+        const payload = buildLeadInsightPersistPayload(
+            schoolId,
+            webhook,
+            insightData,
+            insightData.transcriptHash || transcriptHash
+        );
+        const resolvedName = await applyPriorCallerNameFromHistory(schoolId, {
+            callerName: payload.callerName,
+            callerPhone: payload.callerPhone,
+            tags: payload.tags,
+            callTimestamp: payload.callTimestamp,
+            webhookId: webhook._id,
+        });
+        payload.callerName = resolvedName.callerName;
+        payload.tags = resolvedName.tags;
+        if (resolvedName.usedPastCallName && insightData) {
+            insightData.callerName = resolvedName.callerName;
+            insightData.tags = resolvedName.tags;
+            resolved.set(String(webhook._id), {
+                ...resolved.get(String(webhook._id)),
+                callerName: resolvedName.callerName,
+                tags: resolvedName.tags,
+            });
+        }
+        bulkOps.push({
+            updateOne: {
+                filter: { schoolId, webhookId: webhook._id },
+                update: { $set: payload },
+                upsert: true,
             },
-            upsert: true,
-        },
-    }));
+        });
+    }
 
     await LeadInsight.bulkWrite(bulkOps, { ordered: false })
         .catch((err) => console.error('[LeadInsight] Bulk persist failed:', err.message));
@@ -1032,12 +1229,14 @@ function buildActionNeededCallFromInsight(row, backendUrl, userToken, webhook = 
         })
         : sanitized.tags;
     const summary = resolveCachedSummary(row, webhook);
+    const fromWebhook = webhook ? getCallerNameFromWebhook(webhook, null) : null;
+    const callerName = isUsableCallerName(fromWebhook)
+        ? String(fromWebhook).trim()
+        : (isUsableCallerName(row.callerName) ? String(row.callerName).trim() : (row.callerName || 'Parent'));
     return {
         id: String(row.webhookId),
         conversationId: conversationId || null,
-        callerName: webhook
-            ? getCallerNameFromWebhook(webhook, row.callerName || 'Parent')
-            : (row.callerName || 'Parent'),
+        callerName,
         callerPhone: row.callerPhone || 'Unknown',
         summary,
         timestamp: row.callTimestamp || row.processedAt || new Date(),
@@ -1071,17 +1270,155 @@ async function loadActionNeededCalls(schoolObjectId, backendUrl, userToken, opti
         'missingDetails', 'isHotLead', 'parentSegment', 'aiProcessed', 'processedAt',
     ].join(' ');
 
+    const phoneKey = (phone) => {
+        const digits = String(phone || '').replace(/\D/g, '');
+        if (digits.length >= 10) return digits.slice(-10);
+        return digits.length >= 7 ? digits : '';
+    };
+
+    const toOrdinal = (n) => {
+        const num = Number(n) || 0;
+        const mod100 = num % 100;
+        if (mod100 >= 11 && mod100 <= 13) return `${num}th`;
+        switch (num % 10) {
+            case 1: return `${num}st`;
+            case 2: return `${num}nd`;
+            case 3: return `${num}rd`;
+            default: return `${num}th`;
+        }
+    };
+
+    // Only true follow-ups — do not dump every "unknown" call into Action Needed.
     const cachedRows = await LeadInsight.find({
         schoolId: schoolObjectId,
         callTimestamp: { $gte: since },
-        $or: [
-            { actionNeededEligible: true },
-            { parentSegment: 'unknown' },
-        ],
+        actionNeededEligible: true,
     })
         .select(listProjection)
         .sort({ callTimestamp: -1 })
         .lean();
+
+    const [phoneHistoryRows, allWebhookMeta] = await Promise.all([
+        LeadInsight.find({ schoolId: schoolObjectId })
+            .select('callerPhone callTimestamp webhookId conversationId callerName')
+            .lean(),
+        ElevenLabsWebhook.find({
+            type: 'post_call_transcription',
+            schoolId: schoolObjectId,
+        })
+            .select('_id conversation_id received_at metadata.phone_call metadata.start_time_unix_secs user_id tour_booking_extracted comprehensive_result.parent_name')
+            .lean(),
+    ]);
+
+    const nameHistoryIndex = buildCallerNameHistoryIndex([
+        ...phoneHistoryRows.map((row) => ({
+            phone: row.callerPhone,
+            name: row.callerName,
+            timestamp: row.callTimestamp,
+            webhookId: row.webhookId,
+        })),
+        ...allWebhookMeta.map((wh) => ({
+            phone: getCallerPhoneFromWebhook(wh, ''),
+            name: getCallerNameFromWebhook(wh, null),
+            timestamp: wh.metadata?.start_time_unix_secs
+                ? wh.metadata.start_time_unix_secs * 1000
+                : wh.received_at,
+            webhookId: wh._id,
+        })),
+    ]);
+
+    const applyPastCallerName = (call) => {
+        if (isUsableCallerName(call.callerName)) {
+            return call;
+        }
+        const resolved = resolveCallerNameWithPastFallback(nameHistoryIndex, {
+            callerName: call.callerName,
+            callerPhone: call.callerPhone,
+            callTimestamp: call.timestamp,
+            webhookId: call.id,
+        });
+        if (!resolved.usedPastCallName) return call;
+        return {
+            ...call,
+            callerName: resolved.callerName,
+            tags: withPastCallNameTag(call.tags),
+        };
+    };
+
+    const callsByPhone = new Map();
+    const pushHistory = (phone, ts, webhookId, conversationId) => {
+        const key = phoneKey(phone);
+        if (!key || !ts) return;
+        if (!callsByPhone.has(key)) callsByPhone.set(key, []);
+        callsByPhone.get(key).push({
+            ts,
+            webhookId: webhookId ? String(webhookId) : '',
+            conversationId: conversationId ? String(conversationId) : '',
+        });
+    };
+    for (const row of phoneHistoryRows) {
+        pushHistory(
+            row.callerPhone,
+            row.callTimestamp ? new Date(row.callTimestamp).getTime() : 0,
+            row.webhookId,
+            row.conversationId
+        );
+    }
+    for (const wh of allWebhookMeta) {
+        const ts = wh.metadata?.start_time_unix_secs
+            ? wh.metadata.start_time_unix_secs * 1000
+            : (wh.received_at ? new Date(wh.received_at).getTime() : 0);
+        pushHistory(getCallerPhoneFromWebhook(wh, ''), ts, wh._id, wh.conversation_id);
+    }
+    for (const [key, list] of callsByPhone.entries()) {
+        const seen = new Set();
+        const deduped = [];
+        list.sort((a, b) => a.ts - b.ts || String(a.webhookId).localeCompare(String(b.webhookId)));
+        for (const row of list) {
+            const id = row.webhookId || `${row.conversationId}:${row.ts}`;
+            if (seen.has(id)) continue;
+            seen.add(id);
+            deduped.push(row);
+        }
+        callsByPhone.set(key, deduped);
+    }
+
+    const attachFrequency = (call) => {
+        const key = phoneKey(call.callerPhone);
+        if (!key) {
+            return {
+                ...call,
+                callOrdinal: 1,
+                callCountTotal: 1,
+                callOrdinalLabel: '1st call',
+            };
+        }
+        const history = callsByPhone.get(key) || [];
+        const total = history.length || 1;
+        const sessionTs = new Date(call.timestamp).getTime();
+        let ordinal = 0;
+        for (let i = 0; i < history.length; i++) {
+            const row = history[i];
+            if (
+                (call.id && row.webhookId === String(call.id))
+                || (call.conversationId && row.conversationId && row.conversationId === String(call.conversationId))
+            ) {
+                ordinal = i + 1;
+                break;
+            }
+        }
+        if (!ordinal) {
+            ordinal = history.filter((row) => row.ts <= sessionTs).length || 1;
+        }
+        return {
+            ...call,
+            callOrdinal: ordinal,
+            callCountTotal: total,
+            callOrdinalLabel: total > 1
+                ? `${toOrdinal(ordinal)} of ${total} calls`
+                : `${toOrdinal(ordinal)} call`,
+        };
+    };
 
     if (cachedRows.length > 0) {
         const webhookIds = cachedRows.map((row) => row.webhookId).filter(Boolean);
@@ -1099,7 +1436,9 @@ async function loadActionNeededCalls(schoolObjectId, backendUrl, userToken, opti
                     webhookMap.get(String(row.webhookId)) || null
                 )
             )
-            .filter((call) => !call.actionTaken);
+            .map(applyPastCallerName)
+            .filter((call) => !call.actionTaken)
+            .map(attachFrequency);
     }
 
     const webhooks = await ElevenLabsWebhook.find({
@@ -1126,7 +1465,9 @@ async function loadActionNeededCalls(schoolObjectId, backendUrl, userToken, opti
         .map((wh) =>
             buildActionNeededCall(wh, insightMap.get(String(wh._id)), backendUrl, userToken)
         )
-        .filter((call) => !call.actionTaken);
+        .map(applyPastCallerName)
+        .filter((call) => !call.actionTaken)
+        .map(attachFrequency);
 }
 
 async function markLeadInsightActionTaken(webhookId, feedback = '') {
@@ -1181,6 +1522,7 @@ function buildActionNeededCall(webhook, insight, backendUrl, userToken) {
 module.exports = {
     TOUR_BOOKED_TAG,
     TOUR_BOOKED_EMAIL_MISSING_TAG,
+    PAST_CALL_NAME_TAG,
     hashTranscript,
     getTranscriptText,
     detectHotLead,
@@ -1208,4 +1550,11 @@ module.exports = {
     removeLeadInsightForWebhook,
     buildInsightSnapshot,
     buildLeadInsightPersistPayload,
+    hasPastCallNameTag,
+    withPastCallNameTag,
+    findPriorUsableCallerName,
+    applyPriorCallerNameFromHistory,
+    buildCallerNameHistoryIndex,
+    lookupPriorCallerNameFromIndex,
+    resolveCallerNameWithPastFallback,
 };
