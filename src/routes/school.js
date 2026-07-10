@@ -2162,13 +2162,9 @@ router.get('/call-logs', async (req, res) => {
 
         console.log(`[CallLogs] school=${schoolId} period=${period} total=${sortedLogs.length} webhooks=${webhooks.length}`);
 
-        res.json({
-            logs: sortedLogs,
-            period,
-            periodStart,
-            periodEnd,
-            total: sortedLogs.length,
-        });
+        // Return a bare array for backward compatibility with older frontends that do
+        // `setLogs(res.data)` then `logs.map(...)`. Newer clients also accept this shape.
+        res.json(sortedLogs);
     } catch (err) {
         console.error('Call logs error:', err);
         res.status(500).json({ error: 'Internal server error' });
