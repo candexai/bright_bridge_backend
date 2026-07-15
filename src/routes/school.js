@@ -2984,5 +2984,92 @@ router.post('/test-followup', async (req, res) => {
     }
 });
 
+// GET /api/school/product-tour — first-login product UI tour state
+router.get('/product-tour', async (req, res) => {
+    try {
+        const schoolId = req.user.schoolId;
+        if (!schoolId) {
+            return res.status(400).json({ error: 'No school associated with this account' });
+        }
+
+        const school = await School.findById(schoolId).select('productTour').lean();
+        if (!school) {
+            return res.status(404).json({ error: 'School not found' });
+        }
+
+        const tour = school.productTour || {};
+        res.json({
+            status: tour.status || 'completed',
+            currentStepId: tour.currentStepId || null,
+            completedAt: tour.completedAt || null,
+            skippedSteps: Array.isArray(tour.skippedSteps) ? tour.skippedSteps : [],
+        });
+    } catch (err) {
+        console.error('Get product-tour error:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// PATCH /api/school/product-tour — update tour progress
+router.patch('/product-tour', async (req, res) => {
+    try {
+        const schoolId = req.user.schoolId;
+        if (!schoolId) {
+            return res.status(400).json({ error: 'No school associated with this account' });
+        }
+
+        const { status, currentStepId, skippedSteps } = req.body || {};
+        const allowedStatuses = ['pending', 'in_progress', 'completed', 'dismissed'];
+
+        const $set = {};
+        if (status !== undefined) {
+            if (!allowedStatuses.includes(status)) {
+                return res.status(400).json({ error: 'Invalid product tour status' });
+            }
+            $set['productTour.status'] = status;
+            if (status === 'completed' || status === 'dismissed') {
+                $set['productTour.completedAt'] = new Date();
+                $set['productTour.currentStepId'] = null;
+            }
+        }
+        if (currentStepId !== undefined) {
+            $set['productTour.currentStepId'] = currentStepId === null || currentStepId === ''
+                ? null
+                : String(currentStepId);
+        }
+        if (skippedSteps !== undefined) {
+            if (!Array.isArray(skippedSteps)) {
+                return res.status(400).json({ error: 'skippedSteps must be an array' });
+            }
+            $set['productTour.skippedSteps'] = skippedSteps.map(String);
+        }
+
+        if (Object.keys($set).length === 0) {
+            return res.status(400).json({ error: 'No valid fields to update' });
+        }
+
+        const school = await School.findByIdAndUpdate(
+            schoolId,
+            { $set },
+            { new: true, select: 'productTour' }
+        ).lean();
+
+        if (!school) {
+            return res.status(404).json({ error: 'School not found' });
+        }
+
+        const tour = school.productTour || {};
+        res.json({
+            status: tour.status || 'completed',
+            currentStepId: tour.currentStepId || null,
+            completedAt: tour.completedAt || null,
+            skippedSteps: Array.isArray(tour.skippedSteps) ? tour.skippedSteps : [],
+        });
+    } catch (err) {
+        console.error('Patch product-tour error:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
 module.exports = router;
 

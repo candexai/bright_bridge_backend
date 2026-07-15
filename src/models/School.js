@@ -61,6 +61,17 @@ const schoolSchema = new mongoose.Schema({
     foundingPartner: { type: Boolean, default: false },
     onboardingFeePaid: { type: Boolean, default: false },
     lastBillingCyclePaymentAt: { type: Date, default: null },
+    /** First-login product UI tour for newly registered schools */
+    productTour: {
+        status: {
+            type: String,
+            enum: ['pending', 'in_progress', 'completed', 'dismissed'],
+            default: 'pending',
+        },
+        currentStepId: { type: String, default: null },
+        completedAt: { type: Date, default: null },
+        skippedSteps: { type: [String], default: [] },
+    },
 }, { timestamps: true });
 
 module.exports = mongoose.model('School', schoolSchema);

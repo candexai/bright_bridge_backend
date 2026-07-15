@@ -113,7 +113,38 @@ async function connectDatabase() {
     }
 }
 
+/**
+ * Existing schools should not auto-start the product tour.
+ * Only schools created after this field exists keep status: pending (schema default).
+ */
+async function migrateProductTourDefaults() {
+    const result = await School.updateMany(
+        {
+            $or: [
+                { productTour: { $exists: false } },
+                { 'productTour.status': { $exists: false } },
+                { 'productTour.status': null },
+            ],
+        },
+        {
+            $set: {
+                productTour: {
+                    status: 'completed',
+                    currentStepId: null,
+                    completedAt: new Date(),
+                    skippedSteps: [],
+                },
+            },
+        }
+    );
+    if (result.modifiedCount > 0) {
+        console.log(`ℹ️  Migrated productTour → completed for ${result.modifiedCount} existing school(s)`);
+    }
+}
+
 async function seedDatabase() {
+    await migrateProductTourDefaults();
+
     // Check if data already exists
     const userCount = await User.countDocuments();
     if (userCount > 0) {
