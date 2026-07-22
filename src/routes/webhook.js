@@ -15,10 +15,63 @@ const { generateICS } = require('../utils/ics');
 const { parseLocalDateTimeToUTC } = require('../utils/timezone');
 const { deductCallMinutes } = require('../services/billingService');
 const { mapComprehensiveResult, upsertLeadInsight, resolveParentEmail, isTourBookedEmailMissing } = require('../services/leadInsightService');
+const { detectElevenLabsCallFailure } = require('../utils/elevenLabsCallFailure');
 const jwt = require('jsonwebtoken');
 const JWT_SECRET = process.env.JWT_SECRET || 'childcare-enrollment-ai-secret-key-2024';
 
 const router = express.Router();
+
+/**
+ * Create Admin → Notifications alert (+ CRITICAL email) when ElevenLabs
+ * reports a live-call failure such as quota exceeded.
+ */
+function reportElevenLabsCallFailureAlert({
+    metadata,
+    data,
+    schoolId,
+    conversationId,
+    agentId,
+    webhookId,
+}) {
+    try {
+        const failure = detectElevenLabsCallFailure(metadata || {}, data || {});
+        if (!failure) return;
+
+        const phoneMeta = metadata?.phone_call || {};
+        const callerPhone =
+            phoneMeta.external_number
+            || phoneMeta.from_number
+            || data?.user_id
+            || '';
+
+        console.error(
+            `[Webhook] Live call failure detected conversation=${conversationId}`
+            + ` quota=${failure.isQuota} reason=${failure.terminationReason || failure.errorText || failure.message}`
+        );
+
+        const AlertService = require('../services/alertService');
+        AlertService.create({
+            type: failure.alertType,
+            severity: failure.severity,
+            schoolId: schoolId || null,
+            title: failure.title,
+            message: failure.message,
+            source: 'webhook.elevenlabs.post_call_transcription',
+            metadata: {
+                conversationId,
+                agentId,
+                webhookId: webhookId ? String(webhookId) : undefined,
+                terminationReason: failure.terminationReason || undefined,
+                failureReason: failure.errorText || failure.message,
+                callerPhone: callerPhone || undefined,
+                callDurationSecs: metadata?.call_duration_secs ?? phoneMeta.call_duration_secs,
+                isQuota: failure.isQuota,
+            },
+        });
+    } catch (err) {
+        console.error('[Webhook] Failed to report call-failure alert:', err.message);
+    }
+}
 
 /**
  * POST /api/v1/webhook/elevenlabs
@@ -130,6 +183,17 @@ async function processWebhookAsync(payload) {
                     JSON.stringify(data.transcript[0], null, 2));
             }
 
+            // Always log failure signals so quota / hangups are visible in Live Tail
+            if (metadata.error || metadata.termination_reason || metadata.warnings) {
+                console.warn('[Webhook] Call outcome signals:', JSON.stringify({
+                    conversation_id: conversationId,
+                    termination_reason: metadata.termination_reason || null,
+                    error: metadata.error || null,
+                    warnings: metadata.warnings || null,
+                    call_duration_secs: metadata.call_duration_secs ?? metadata.phone_call?.call_duration_secs ?? null,
+                }));
+            }
+
         } else if (type === 'post_call_audio') {
             console.log('[Webhook] Processing post_call_audio webhook');
             console.log('[Webhook] Conversation ID:', conversationId);
@@ -158,6 +222,18 @@ async function processWebhookAsync(payload) {
         savedWebhook.processed = true;
         await savedWebhook.save();
         console.log('[Webhook] Webhook marked as processed');
+
+        // Detect critical live-call failures (quota exhaustion, agent errors) from metadata
+        if (type === 'post_call_transcription') {
+            reportElevenLabsCallFailureAlert({
+                metadata,
+                data,
+                schoolId,
+                conversationId,
+                agentId,
+                webhookId: savedWebhook._id,
+            });
+        }
 
         if (type === 'post_call_transcription' && schoolId) {
             deductCallMinutes(savedWebhook).catch((err) => {

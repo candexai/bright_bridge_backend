@@ -77,7 +77,8 @@ async function createAlertInternal(payload) {
         return null;
     }
 
-    const effectiveSeverity = type === 'OUTLOOK_ERROR' ? 'CRITICAL' : severity;
+    const effectiveSeverity =
+        type === 'OUTLOOK_ERROR' || type === 'RATE_LIMIT_ERROR' ? 'CRITICAL' : severity;
 
     const mergedMetadata = {
         ...metadata,

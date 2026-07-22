@@ -16,7 +16,7 @@ const TYPE_SUMMARIES = {
     PAYMENT_ERROR: 'PayPal billing or minute deduction encountered an error.',
     AGENT_ERROR: 'ElevenLabs agent creation, sync, or phone linking failed.',
     INTEGRATION_ERROR: 'A third-party integration (Google, translate, etc.) failed.',
-    RATE_LIMIT_ERROR: 'An external API rate limit was hit (OpenAI, ElevenLabs, etc.).',
+    RATE_LIMIT_ERROR: 'An external API rate limit or quota was hit (OpenAI, ElevenLabs, etc.). Nora or AI features may stop until credits/limits are restored.',
     UNKNOWN_ERROR: 'An unexpected error was reported.',
 };
 
@@ -32,6 +32,8 @@ const TYPE_ACTIONS = {
     PAYMENT_ERROR: 'Compare PayPal dashboard with billing transactions. Verify webhook signature and amounts.',
     AGENT_ERROR: 'Open school settings; re-sync agent or re-run agent creation for the school.',
     CRON_ERROR: 'Check reminderService logs on the server.',
+    RATE_LIMIT_ERROR:
+        'CRITICAL: Top up ElevenLabs workspace credits immediately. Until credits are restored, Nora will hang up on live calls. Check ElevenLabs → Subscription / Usage, then place a test call.',
 };
 
 function stringifyDetail(value) {
@@ -63,6 +65,12 @@ function expandShortMessage(message) {
         return [
             m,
             'The Outlook refresh token is no longer valid. The school must sign in again under Integrations.',
+        ].join(' ');
+    }
+    if (lower.includes('quota') || lower.includes('credits remaining')) {
+        return [
+            m,
+            'ElevenLabs has run out of credits for this workspace. Nora will hang up on live calls until the quota is topped up in the ElevenLabs dashboard.',
         ].join(' ');
     }
     if (lower.includes('smtp not configured')) {
@@ -101,6 +109,15 @@ function buildEnrichedAlertMessage({ type, title, message, source, metadata = {}
     }
     if (metadata.orderId) {
         parts.push(`PayPal order ID: ${metadata.orderId}`);
+    }
+    if (metadata.conversationId) {
+        parts.push(`Conversation ID: ${metadata.conversationId}`);
+    }
+    if (metadata.callerPhone) {
+        parts.push(`Caller: ${metadata.callerPhone}`);
+    }
+    if (metadata.terminationReason) {
+        parts.push(`Termination reason: ${stringifyDetail(metadata.terminationReason)}`);
     }
     if (metadata.agentId) {
         parts.push(`ElevenLabs agent ID: ${metadata.agentId}`);
