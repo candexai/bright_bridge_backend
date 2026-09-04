@@ -1612,6 +1612,7 @@ router.get('/daily-insights', async (req, res) => {
             wordCloud,
             todayCalls,
             hotLeads: actionNeeded.filter((call) => call.isHotLead),
+            warmLeads: actionNeeded.filter((call) => call.leadTemperature === 'warm'),
         });
         console.log(
             `[DailyInsights] school=${schoolId} actionNeeded=${actionNeeded.length} tours=${todaysTours.length} todayCalls=${todayCalls.length} ${Date.now() - startedAt}ms`
@@ -1641,6 +1642,7 @@ router.get('/action-needed', async (req, res) => {
         res.json({
             actionNeeded,
             hotLeads: actionNeeded.filter((call) => call.isHotLead),
+            warmLeads: actionNeeded.filter((call) => call.leadTemperature === 'warm'),
         });
     } catch (err) {
         console.error('Action needed error:', err);
