@@ -196,6 +196,35 @@ async function updatePhoneNumber(phoneNumberId, payload) {
     }
 }
 
+async function deleteAgent(agentId) {
+    const baseUrl = process.env.ELEVENLABS_API_URL;
+    if (!baseUrl || !agentId) {
+        console.warn('[Agent Delete] ELEVENLABS_API_URL not configured or agentId missing');
+        return null;
+    }
+
+    try {
+        const url = `${baseUrl}/api/v1/agents/${agentId}`;
+        console.log(`[Agent Delete] DELETE ${url}`);
+
+        const response = await axios.delete(url, {
+            headers: {
+                'accept': 'application/json',
+                ...(process.env.ELEVENLABS_API_KEY && { 'Authorization': `Bearer ${process.env.ELEVENLABS_API_KEY}` })
+            },
+            validateStatus: (s) => s < 500 || s === 404,
+        });
+
+        console.log(`[Agent Delete] Status: ${response.status}`);
+        return response.data;
+    } catch (err) {
+        console.error(`[Agent Delete] Failed to delete agent`);
+        console.error(`[Agent Delete] Error Status:`, err.response?.status);
+        console.error(`[Agent Delete] Error Data:`, JSON.stringify(err.response?.data || {}, null, 2));
+        throw new Error(err.response?.data?.detail?.[0]?.msg || err.message);
+    }
+}
+
 async function deletePhoneNumber(phoneNumberId) {
     const baseUrl = process.env.ELEVENLABS_API_URL;
     if (!baseUrl) {
@@ -972,6 +1001,7 @@ module.exports = {
     createSchoolAgent,
     importSipTrunk,
     deletePhoneNumber,
+    deleteAgent,
     updatePhoneNumber,
     registerTool,
     deleteTool,

@@ -2184,12 +2184,12 @@ router.get('/calls/:conversationId/audio', async (req, res) => {
             conversation_id: conversationId,
             type: 'post_call_audio',
             schoolId: schoolObjectId,
-        }).select('audio_base64').lean();
+        }).select('audio_base64 metadata').lean();
 
         if (audioWebhook && audioWebhook.audio_base64) {
             console.log(`[Audio] Serving from cache: ${conversationId}`);
             const audioBuffer = Buffer.from(audioWebhook.audio_base64, 'base64');
-            return sendAudioBufferWithRange(req, res, audioBuffer);
+            return sendAudioBufferWithRange(req, res, audioBuffer, audioWebhook.metadata?.contentType || 'audio/mpeg');
         }
 
         // ── Strategy 2: Mock/Test Fallback ────────────────
@@ -2208,6 +2208,26 @@ router.get('/calls/:conversationId/audio', async (req, res) => {
             const audio = await provider.getConversationAudio(conversationId);
             if (audio?.buffer) {
                 console.log(`[Audio Proxy] Success for: ${conversationId}`);
+                // Cache so repeat plays/seeks (range requests) of this same recording hit
+                // Strategy 1 instead of re-fetching the whole file from the provider every time —
+                // this was the main cause of slow/repeated recording loads.
+                ElevenLabsWebhook.findOneAndUpdate(
+                    { conversation_id: conversationId, type: 'post_call_audio', schoolId: schoolObjectId },
+                    {
+                        $setOnInsert: {
+                            conversation_id: conversationId,
+                            type: 'post_call_audio',
+                            schoolId: schoolObjectId,
+                            received_at: new Date(),
+                            processed: true,
+                        },
+                        $set: {
+                            audio_base64: audio.buffer.toString('base64'),
+                            metadata: { contentType: audio.contentType || 'audio/mpeg' },
+                        },
+                    },
+                    { upsert: true }
+                ).catch((err) => console.warn(`[Audio Proxy] Failed to cache audio for ${conversationId}:`, err.message));
                 return sendAudioBufferWithRange(req, res, audio.buffer, audio.contentType);
             }
         } catch (proxyErr) {

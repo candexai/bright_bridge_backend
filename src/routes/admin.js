@@ -1231,6 +1231,17 @@ router.delete('/schools/:id', async (req, res) => {
         const schoolAiDigits = normalizePhone(school.aiNumber);
         const voiceAiParticipantId = schoolAiDigits ? `sip_+${schoolAiDigits}` : null;
 
+        // Best-effort: remove the school's agent from its voice provider (Cartesia/ElevenLabs)
+        // before wiping DB records, so it doesn't linger as an orphaned agent there.
+        if (school.elevenlabsAgentId) {
+            try {
+                await getProvider(school.voiceProvider || 'elevenlabs').deleteAgent(school.elevenlabsAgentId);
+                console.log(`[Admin] Deleted voice provider agent ${school.elevenlabsAgentId} (${school.voiceProvider || 'elevenlabs'}) for school ${id}`);
+            } catch (err) {
+                console.warn(`[Admin] Failed to delete voice provider agent ${school.elevenlabsAgentId}:`, err.message);
+            }
+        }
+
         const objectId = new mongoose.Types.ObjectId(id);
         await Promise.all([
             User.deleteMany({ schoolId: objectId }),

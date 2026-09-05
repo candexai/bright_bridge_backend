@@ -484,6 +484,22 @@ async function updatePhoneNumber(phoneNumberId, payload) {
     }
 }
 
+async function deleteAgent(agentId) {
+    const baseUrl = getCartesiaBaseUrl();
+    if (!baseUrl || !agentId) return null;
+    try {
+        const response = await axios.delete(`${baseUrl}/agents/${encodeURIComponent(agentId)}`, {
+            headers: cartesiaHeaders(),
+            timeout: 30000,
+            validateStatus: (s) => s < 500 || s === 404,
+        });
+        return response.data;
+    } catch (err) {
+        console.error('[Cartesia Agent Delete] failed:', err.response?.status, JSON.stringify(err.response?.data || {}));
+        throw new Error(err.response?.data?.detail || err.message);
+    }
+}
+
 async function deletePhoneNumber(phoneNumberId) {
     const baseUrl = getCartesiaBaseUrl();
     if (!baseUrl) return null;
@@ -625,6 +641,7 @@ module.exports = {
     importSipTrunk,
     updatePhoneNumber,
     deletePhoneNumber,
+    deleteAgent,
     getConversationAudio,
     checkHealth,
     normalizeCartesiaWebhookPayload,
