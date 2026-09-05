@@ -962,7 +962,7 @@ Please call the parent back to collect it.
         }
 
         emailBody += `Best regards,
-Childcare Enrollment AI Platform`;
+BrightBridge Platform`;
 
         // Send email using the school's preferred provider (Google/Outlook), with SMTP fallback.
         // Note: this replaces the previous hardcoded Gmail-only flow.

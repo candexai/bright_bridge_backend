@@ -709,12 +709,16 @@ function hasSchoolRelatedIntent({
         ? comprehensiveResult.topics_of_interest.join(' ')
         : '';
     const inquiryHaystack = `${callerText} ${(questionsAsked || []).join(' ')} ${topics}`.toLowerCase();
-    const summaryText = String(summary || '').toLowerCase();
     const tagHaystack = (Array.isArray(tags) ? tags : []).join(' ').toLowerCase();
 
     if (/tour requested|hot lead|urgency:/i.test(tagHaystack)) return true;
     if (NEW_PARENT_INTENT_PATTERNS.some((pattern) => pattern.test(inquiryHaystack))) return true;
-    if (NEW_PARENT_INTENT_PATTERNS.some((pattern) => pattern.test(summaryText))) return true;
+    // Deliberately does NOT keyword-scan the free-text `summary` itself: it's AI-generated prose
+    // that can state a negation ("unrelated to school enrollment") containing the very keywords
+    // (e.g. "enrollment") this function looks for, which previously caused non-enrollment calls
+    // (vendors, wrong numbers) to be misclassified as new_parent leads. callerText/questionsAsked/
+    // topics_of_interest above are the extractor's own structured, negation-aware fields — trust
+    // those instead.
 
     const realQuestions = (questionsAsked || []).filter((q) => String(q || '').trim().length > 8);
     if (realQuestions.length > 0) {

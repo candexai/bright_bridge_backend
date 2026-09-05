@@ -73,7 +73,7 @@ async function start() {
         initReminderService();
 
         app.listen(PORT, () => {
-            console.log(`\n🚀 Childcare Enrollment AI Backend`);
+            console.log(`\n🚀 BrightBridge Backend`);
             console.log(`   Server running on http://localhost:${PORT}`);
             console.log(`   Database: MongoDB`);
             console.log(`   API Health: http://localhost:${PORT}/api/health`);

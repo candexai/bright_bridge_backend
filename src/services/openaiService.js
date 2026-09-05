@@ -66,7 +66,7 @@ function formatTranscript(transcriptArray) {
 /**
  * Process transcript with comprehensive prompt to extract all information
  */
-async function processTranscriptComprehensive(transcriptArray) {
+async function processTranscriptComprehensive(transcriptArray, referenceDate) {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
         console.warn('[OpenAI] OPENAI_API_KEY not configured, skipping comprehensive processing');
@@ -135,7 +135,7 @@ async function processTranscriptComprehensive(transcriptArray) {
             };
         }
 
-        const prompt = getComprehensivePrompt(transcriptText);
+        const prompt = getComprehensivePrompt(transcriptText, referenceDate);
 
         const response = await axios.post(
             'https://api.openai.com/v1/chat/completions',
@@ -221,11 +221,11 @@ function extractSummaryFromComprehensive(comprehensiveResult) {
 /**
  * Process transcript with comprehensive prompt (main function)
  */
-async function processTranscript(transcriptArray) {
+async function processTranscript(transcriptArray, referenceDate) {
     try {
         console.log('[OpenAI] Starting comprehensive transcript processing...');
-        
-        const comprehensiveResult = await processTranscriptComprehensive(transcriptArray);
+
+        const comprehensiveResult = await processTranscriptComprehensive(transcriptArray, referenceDate);
         
         if (!comprehensiveResult) {
             console.warn('[OpenAI] Comprehensive processing failed, returning empty result');

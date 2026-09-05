@@ -1,7 +1,7 @@
 {
-  "name": "childcare-enrollment-ai-backend",
+  "name": "brightbridge-backend",
   "version": "1.0.0",
-  "description": "Backend for Childcare Enrollment AI Platform (MongoDB)",
+  "description": "Backend for BrightBridge, an AI-powered childcare enrollment platform (MongoDB)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

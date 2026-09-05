@@ -8,12 +8,18 @@
  * @param {string} transcriptText - The transcript text to analyze
  * @returns {string} - The complete prompt
  */
-function getComprehensivePrompt(transcriptText) {
+function getComprehensivePrompt(transcriptText, referenceDate) {
+    const todayIso = (referenceDate instanceof Date ? referenceDate : new Date()).toISOString().slice(0, 10);
+    const todayWeekday = (referenceDate instanceof Date ? referenceDate : new Date()).toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' });
     return `You are processing a phone call transcript between a school enrollment AI agent (Nora) at Kids R Kids on Franz Road and a caller (usually a parent or guardian).
+
+This call took place on or immediately before ${todayIso} (a ${todayWeekday}). Use this as "today" for resolving ANY date the agent or caller mentions — including explicit dates, weekday names ("Monday, September 7th"), and relative phrases ("next week", "tomorrow"). tour_date and tour_datetime_iso MUST use the year from this reference date (or the following year only if the stated month/day has already passed relative to it) — never guess an unrelated year. Before finalizing tour_date, verify the weekday name you output is self-consistent: the calendar weekday of tour_date must actually match any weekday name spoken in the transcript (e.g. if the transcript says "Monday, September 7th", pick the real calendar year, at or after the reference date, in which September 7 truly falls on a Monday — do not output a year where the dates don't line up).
 
 Your job is to extract ALL information in a single pass and return ONE structured JSON object.
 
 Always respond in English, even if the conversation was in Spanish.
+
+All extracted text fields (parent_name, child_name, questions_asked, topics_of_interest, summary, email subject/body, one_pager fields, etc.) MUST be written using the English/Latin alphabet (a-z, A-Z), regardless of what script or language the caller actually spoke in. If a name or phrase was spoken in Hindi, Spanish, or any other language, transliterate it phonetically into the Latin alphabet (e.g. "शगुन यादव" -> "Shagun Yadav") — never output Devanagari or any other non-Latin script. Do NOT translate names into a different name; only transliterate the sound into Latin letters.
 
 Do NOT invent, assume, or hallucinate any details not explicitly stated in the transcript.
 
@@ -21,7 +27,7 @@ Determine the call state:
 
 - "complete": All 5 required fields collected (caller name, phone, email, child name, child age) AND call ended normally
 - "partial": Some fields collected but call ended early, parent hung up, or booking was not completed
-- "no_interaction": Caller said nothing meaningful (only greetings, silence, background noise, or misdial). NEVER use this when the caller identified as a current enrolled family member — even if the call was brief or ended after a front-desk transfer.
+- "no_interaction": Caller said nothing meaningful (only greetings, silence, background noise, or misdial). NEVER use this when the caller identified as a current enrolled family member — even if the call was brief or ended after a front-desk transfer. NEVER use this if the caller asked ANY real question or made ANY real request (e.g. "can you tell me about enrollment", asking about tuition/hours/programs/tours) — that alone is meaningful interaction, even if Nora never captured the caller's name, phone, or other details afterward (for example because the caller's speech kept getting cut off). Use "partial" for that case instead, and describe in the summary what the caller asked about and what was or was not captured. Reserve "no_interaction" for calls where the caller's turns contain no discernible question, request, or statement at all — not merely for calls where later turns (like giving a name) were garbled or incomplete.
 
 CURRENT ENROLLED FAMILY TRANSFERS:
 
@@ -30,6 +36,13 @@ CURRENT ENROLLED FAMILY TRANSFERS:
 - tags: MUST include "Current Family" ONLY when the caller explicitly said they are a current/existing family or already enrolled in the transcript. NEVER tag Current Family because Nora asked the opening routing question or because the summary assumes it.
 - summary: state clearly that the caller identified as a current enrolled family member and that the call was transferred (or Nora offered to connect them) to the front desk. If the caller asked any other questions before or during the call, include those in the summary and in questions_asked.
 - NEVER write "No meaningful interaction" for these calls.
+
+NON-ENROLLMENT CALLERS (vendors, salespeople, solicitors, job seekers, deliveries, wrong numbers, robocalls, etc.):
+
+- If the caller states or makes clear a real reason for calling that has nothing to do with school enrollment (e.g. "I'm calling to sell my books", a sales pitch, a job application, a delivery notice, a wrong number, spam/robocall content), this IS meaningful interaction — the caller communicated something real, it is just not an enrollment inquiry.
+- call_state: use "partial" (not "no_interaction"), UNLESS the caller said absolutely nothing discernible at all (see "no_interaction" above), even if Nora redirected or transferred them quickly.
+- summary: state clearly and specifically what the caller's actual reason for calling was (e.g. "The caller was a vendor trying to sell books, unrelated to school enrollment. Nora redirected them to the front desk."). NEVER write the generic "No meaningful interaction. The call was interrupted or the caller did not engage." line for a call where the caller stated a real, non-enrollment reason — that phrasing is reserved strictly for calls where the caller said nothing discernible at all.
+- tags: apply "Unknown" per its existing rule (no enrollment details, no school questions, no tour request, not a current-family transfer). Do NOT apply "Hot lead", "Partial call" (unless the call was also brief/incomplete on its own merits), or any enrollment-intent tags to these calls.
 
 Required fields to extract (set to null if not mentioned):
 
@@ -111,7 +124,7 @@ Generate three outputs from this data:
 
 - Partial call: what was collected, note that the call ended before completion
 
-- No interaction: state clearly "No meaningful interaction. The call was interrupted or the caller did not engage." (Never use this for current-family transfer calls.)
+- No interaction: state clearly "No meaningful interaction. The call was interrupted or the caller did not engage." (Never use this for current-family transfer calls, for any call where the caller asked a real question or made a real request, or for any non-enrollment caller (vendor, sales, wrong number, etc.) who stated a real reason for calling — those all get call_state "partial" and a summary describing what actually happened.)
 
 - Current family transfer: e.g. "The caller identified as a current enrolled family member. The call was transferred to the front desk." Include any additional questions they asked.
 
