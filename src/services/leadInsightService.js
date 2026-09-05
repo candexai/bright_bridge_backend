@@ -634,16 +634,13 @@ function llmFlaggedHotLead(tags) {
 }
 
 /**
- * LEAD TEMPERATURE — hot / warm / cold. For a prospective (new) family:
- *   HOT: a tour booked, strong enrollment urgency/near-term date, or TWO independent buying
- *        signals together (a school/KB question AND enrollment/tour intent) — or one signal
- *        the LLM's own extraction also independently flagged as hot.
- *   WARM: exactly one buying signal alone (a KB question, or soft enrollment/tour intent) with
- *        nothing else corroborating it — genuine interest, but not yet a strong signal.
+ * LEAD TEMPERATURE — hot / cold (no "warm" tier). For a prospective (new) family:
+ *   HOT: a tour booked, strong enrollment urgency/near-term date, a school/KB question,
+ *        enrollment/tour intent, or the LLM's own extraction independently flagged it hot —
+ *        ANY ONE of these signals alone is enough.
  *   COLD: no meaningful interaction, unknown segment, or no buying signal at all.
- * A current family is hot only when it raises a substantive service question (see
- * CURRENT_FAMILY_INQUIRY_PATTERNS), warm when it engages but not substantively, and cold
- * otherwise. Non-parent (teacher/vendor/employment) calls are always cold via parentSegment.
+ * A current family is hot when it raises any real service question, cold otherwise.
+ * Non-parent (teacher/vendor/employment) calls are always cold via parentSegment.
  */
 function classifyLeadTemperature({
     tags = [],
@@ -667,22 +664,17 @@ function classifyLeadTemperature({
 
     const schoolInquiry = hasSchoolKbInquiry({ questionsAsked, callerText, comprehensiveResult });
 
-    // Current families: hot only with a substantive service question, warm with lighter engagement.
+    // Current families: hot on any real service question, cold otherwise.
     if (parentSegment === 'current_family') {
-        if (!schoolInquiry) return 'cold';
-        const inquiryHaystack = `${callerText} ${filterSchoolQuestions(questionsAsked).join(' ')}`.trim();
-        return CURRENT_FAMILY_INQUIRY_PATTERNS.some((pattern) => pattern.test(inquiryHaystack)) ? 'hot' : 'warm';
+        return schoolInquiry ? 'hot' : 'cold';
     }
 
-    // Prospective (new) families.
+    // Prospective (new) families: any single buying signal is enough to be hot.
     const strongIntent = hasStrongEnrollmentIntent({ comprehensiveResult, tags, tourBooked });
     const softIntent = hasEnrollmentOrTourIntent({ callerText, questionsAsked, comprehensiveResult });
     const llmFlaggedHot = llmFlaggedHotLead(tags) && comprehensiveResult?.call_state !== 'no_interaction';
 
-    if (tourBooked || strongIntent) return 'hot';
-    if (schoolInquiry && softIntent) return 'hot';
-    if (schoolInquiry || softIntent) return llmFlaggedHot ? 'hot' : 'warm';
-    if (llmFlaggedHot) return 'warm';
+    if (tourBooked || strongIntent || schoolInquiry || softIntent || llmFlaggedHot) return 'hot';
 
     return 'cold';
 }
@@ -903,8 +895,6 @@ function enrichTags(tags, leadTemperature, parentSegment) {
     next = next.filter((tag) => tag.toLowerCase() !== 'hot lead' && tag.toLowerCase() !== 'warm lead');
     if (leadTemperature === 'hot' && !hasTag('Hot Lead')) {
         next.unshift('Hot Lead');
-    } else if (leadTemperature === 'warm' && !hasTag('Warm Lead')) {
-        next.unshift('Warm Lead');
     }
 
     if (parentSegment === 'current_family' && !hasTag('Current Family')) {
