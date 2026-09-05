@@ -178,12 +178,14 @@ const NEW_PARENT_INTENT_PATTERNS = [
     /\badmission\b/i,
     /\btour(?:ing|s)?\b/i,
     /\bvisit(?:ing)?\b|\bschedule\b|\bbook(?:ing)?\b|\blook(?:ing)? around\b/i,
-    /tuition|price|cost|fee|afford|financial aid/i,
-    /callback|call (?:me )?back|speak (?:to|with) (?:someone|staff|a person)/i,
-    /urgent|as soon as possible|starting (?:next week|soon)/i,
-    /program|curriculum|classroom|hours|pickup|drop.?off|meal|food|ratio|teacher|camera|security|summer camp|after.?school/i,
-    /daycare|childcare|child care|preschool|pre.?k\b/i,
-    /moving to (?:the )?area|new to (?:the )?area/i,
+    // Word-bounded so e.g. "prices of new cars" doesn't false-match on "price", "food" doesn't
+    // match inside "football", "fee" doesn't match inside "coffee", etc.
+    /\btuition\b|\bprices?\b|\bpricing\b|\bcosts?\b|\bfees?\b|\bafford\w*\b|\bfinancial aid\b/i,
+    /\bcallback\b|\bcall (?:me )?back\b|\bspeak (?:to|with) (?:someone|staff|a person)\b/i,
+    /\burgent\b|\bas soon as possible\b|\bstarting (?:next week|soon)\b/i,
+    /\bprogram\b|\bcurriculum\b|\bclassroom\b|\bhours\b|\bpickup\b|\bdrop.?off\b|\bmeal\b|\bfood\b|\bratio\b|\bteacher\b|\bcamera\b|\bsecurity\b|\bsummer camp\b|\bafter.?school\b/i,
+    /\bdaycare\b|\bchildcare\b|\bchild care\b|\bpreschool\b|\bpre.?k\b/i,
+    /\bmoving to (?:the )?area\b|\bnew to (?:the )?area\b/i,
 ];
 
 /** Current-family calls only count as hot when they ask about something substantive. */
@@ -700,7 +702,13 @@ function hasSchoolRelatedIntent({
     const topics = Array.isArray(comprehensiveResult?.topics_of_interest)
         ? comprehensiveResult.topics_of_interest.join(' ')
         : '';
-    const inquiryHaystack = `${callerText} ${(questionsAsked || []).join(' ')} ${topics}`.toLowerCase();
+    // Deliberately excludes raw callerText: NEW_PARENT_INTENT_PATTERNS includes generic words
+    // ("price", "cost", "food", "hours") that show up in plenty of sentences that have nothing
+    // to do with the school (e.g. "the prices of new cars") — scanning the caller's full raw
+    // speech re-introduces exactly the false positives that questionsAsked/topics_of_interest
+    // already filtered out via isSchoolKbTopic upstream. Those two are the extractor's own
+    // curated, contextualized signals — trust those instead of re-scanning unfiltered text.
+    const inquiryHaystack = `${(questionsAsked || []).join(' ')} ${topics}`.toLowerCase();
     const tagHaystack = (Array.isArray(tags) ? tags : []).join(' ').toLowerCase();
 
     if (/tour requested|hot lead|urgency:/i.test(tagHaystack)) return true;
