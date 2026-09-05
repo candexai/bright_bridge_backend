@@ -603,11 +603,6 @@ router.get('/dashboard', async (req, res) => {
         console.log(`[DASHBOARD DEBUG] Total calls: ${calls.length}, Period calls: ${periodCalls.length}`);
 
         const webhookLookup = buildWebhookLookup(schoolWebhooks);
-        // Warm insight resolution for webhooks (segment/tags used by KPIs + recent calls).
-        await resolveInsightsForWebhooks(schoolWebhooks, schoolObjectId, {
-            allowOpenAI: false,
-            persist: false,
-        });
 
         const resolveCallWebhook = (call) => {
             if (call.conversationId) {

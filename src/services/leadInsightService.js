@@ -1208,17 +1208,23 @@ async function buildInsightDataForWebhook(webhook, { allowOpenAI = false } = {})
 }
 
 async function resolveInsightsForWebhooks(webhooks, schoolId, options = {}) {
-    const { allowOpenAI = false, persist = false } = options;
+    const { allowOpenAI = false, persist = false, preFetchedInsights = null } = options;
     if (!Array.isArray(webhooks) || webhooks.length === 0) {
         return new Map();
     }
 
     const webhookIds = webhooks.map((wh) => wh._id);
-    const existingInsights = await LeadInsight.find({
-        schoolId,
-        webhookId: { $in: webhookIds },
-        aiProcessed: true,
-    }).lean();
+    // Callers that already fetched this school's LeadInsight rows in the same parallel batch
+    // (e.g. for name-history lookups) can pass them here to skip an extra sequential DB
+    // round-trip — each one costs a full network round-trip to the DB, which adds up.
+    const webhookIdSet = new Set(webhookIds.map(String));
+    const existingInsights = Array.isArray(preFetchedInsights)
+        ? preFetchedInsights.filter((doc) => doc.aiProcessed && webhookIdSet.has(String(doc.webhookId)))
+        : await LeadInsight.find({
+            schoolId,
+            webhookId: { $in: webhookIds },
+            aiProcessed: true,
+        }).lean();
 
     const insightMap = new Map(existingInsights.map((doc) => [String(doc.webhookId), doc]));
     const resolved = new Map();
@@ -1362,18 +1368,22 @@ async function loadActionNeededCalls(schoolObjectId, backendUrl, userToken, opti
     };
 
     // Only true follow-ups — do not dump every "unknown" call into Action Needed.
-    const cachedRows = await LeadInsight.find({
-        schoolId: schoolObjectId,
-        callTimestamp: { $gte: since },
-        actionNeededEligible: true,
-    })
-        .select(listProjection)
-        .sort({ callTimestamp: -1 })
-        .lean();
-
-    const [phoneHistoryRows, allWebhookMeta] = await Promise.all([
+    // These three queries are independent of each other, so run them together instead of
+    // sequentially — each round-trip to the DB has a fixed network cost regardless of query
+    // complexity, so cutting the number of round-trips matters more than query efficiency here.
+    // phoneHistoryRows also selects the fields resolveInsightsForWebhooks needs below, so its
+    // own separate LeadInsight lookup can reuse this instead of querying again.
+    const [cachedRows, phoneHistoryRows, allWebhookMeta] = await Promise.all([
+        LeadInsight.find({
+            schoolId: schoolObjectId,
+            callTimestamp: { $gte: since },
+            actionNeededEligible: true,
+        })
+            .select(listProjection)
+            .sort({ callTimestamp: -1 })
+            .lean(),
         LeadInsight.find({ schoolId: schoolObjectId })
-            .select('callerPhone callTimestamp webhookId conversationId callerName')
+            .select('callerPhone callTimestamp webhookId conversationId callerName aiProcessed parentSegment tags summary tourBooked childName childAge language missingDetails questionsAsked')
             .lean(),
         ElevenLabsWebhook.find({
             type: 'post_call_transcription',
@@ -1532,6 +1542,7 @@ async function loadActionNeededCalls(schoolObjectId, backendUrl, userToken, opti
     const insightMap = await resolveInsightsForWebhooks(eligibleWebhooks, schoolObjectId, {
         allowOpenAI: false,
         persist: false,
+        preFetchedInsights: phoneHistoryRows,
     });
 
     return eligibleWebhooks
