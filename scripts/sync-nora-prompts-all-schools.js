@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * Push the latest Nora first message + system prompt to every school's ElevenLabs agent.
+ * Push the latest Nora first message + system prompt to every school's voice-provider agent
+ * (Cartesia or ElevenLabs, whichever the school actually uses).
  * Usage:
  *   node scripts/sync-nora-prompts-all-schools.js [--dry-run] [--schoolId=<id>]
  */
@@ -11,10 +12,8 @@ const path = require('path');
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
 
 const School = require('../src/models/School');
-const {
-    syncSchoolAgent,
-    buildDefaultSchoolAgentPrompts,
-} = require('../src/services/voiceProviders/elevenlabs');
+const { getProvider } = require('../src/services/voiceProviders');
+const { buildDefaultSchoolAgentPrompts } = require('../src/services/voiceProviders/shared/promptTemplates');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -26,9 +25,6 @@ async function syncNoraPromptsAllSchools() {
     if (!process.env.MONGODB_URI) {
         throw new Error('MONGODB_URI is not set');
     }
-    if (!dryRun && !process.env.ELEVENLABS_API_URL) {
-        throw new Error('ELEVENLABS_API_URL is not set');
-    }
 
     await mongoose.connect(process.env.MONGODB_URI);
     console.log(`Connected to MongoDB${dryRun ? ' (dry run)' : ''}`);
@@ -38,7 +34,7 @@ async function syncNoraPromptsAllSchools() {
     };
 
     const schools = await School.find(query)
-        .select('name script systemPrompt elevenlabsAgentId knowledgeBaseDocumentId enableHumanTransfer humanTransferCondition humanTransferPhoneNumber status')
+        .select('name voiceProvider script systemPrompt elevenlabsAgentId knowledgeBaseDocumentId enableHumanTransfer humanTransferCondition humanTransferPhoneNumber status')
         .sort({ name: 1 })
         .lean();
 
@@ -50,15 +46,16 @@ async function syncNoraPromptsAllSchools() {
 
     for (const school of schools) {
         const agentId = String(school.elevenlabsAgentId || '').trim();
+        const voiceProvider = school.voiceProvider || 'elevenlabs';
         const { firstMessage, systemPrompt } = buildDefaultSchoolAgentPrompts(school.name);
 
         if (!agentId) {
             skipped += 1;
-            console.log(`[skip] ${school.name}: no elevenlabsAgentId`);
+            console.log(`[skip] ${school.name}: no agent id`);
             continue;
         }
 
-        console.log(`[${dryRun ? 'would sync' : 'sync'}] ${school.name} (${agentId})`);
+        console.log(`[${dryRun ? 'would sync' : 'sync'}] ${school.name} (${agentId}, ${voiceProvider})`);
 
         if (dryRun) {
             synced += 1;
@@ -66,7 +63,8 @@ async function syncNoraPromptsAllSchools() {
         }
 
         try {
-            await syncSchoolAgent(agentId, {
+            const provider = getProvider(voiceProvider);
+            await provider.syncSchoolAgent(agentId, {
                 firstMessage,
                 systemPrompt,
                 knowledgeBaseId: school.knowledgeBaseDocumentId || '',
